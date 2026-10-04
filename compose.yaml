@@ -1,0 +1,85 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/er1c-zh/vocab-selfhost:0.1.0
+    restart: unless-stopped
+    environment:
+      APP_ADDR: :8080
+      APP_DATA_DIR: /data
+      AI_SERVICE_URL: http://ai:8000
+    ports:
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8080}:8080"
+    volumes:
+      - vocab-data:/data
+    depends_on:
+      ai:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/vocab-api", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  ai:
+    build:
+      context: ./ai
+      dockerfile: Dockerfile
+    image: ghcr.io/er1c-zh/vocab-selfhost-ai:0.1.0
+    restart: unless-stopped
+    environment:
+      AI_CACHE_DIR: /models
+      HF_HOME: /models/huggingface
+      TRANSFORMERS_CACHE: /models/huggingface
+      ASR_MODEL: ${ASR_MODEL:-base.en}
+      AI_TEXT_PROVIDER: ${AI_TEXT_PROVIDER:-disabled}
+      AI_TEXT_BASE_URL: ${AI_TEXT_BASE_URL:-http://ollama:11434/v1}
+      AI_TEXT_MODEL: ${AI_TEXT_MODEL:-qwen2.5:3b}
+      AI_TEXT_API_KEY: ${AI_TEXT_API_KEY:-}
+    volumes:
+      - ai-models:/models
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    expose:
+      - "11434"
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["https"]
+    restart: unless-stopped
+    environment:
+      WORDWELL_DOMAIN: ${WORDWELL_DOMAIN:?Set WORDWELL_DOMAIN in .env before enabling HTTPS}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  vocab-data:
+  ai-models:
+  ollama-models:
+  caddy-data:
+  caddy-config:
+

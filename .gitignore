@@ -1,0 +1,16 @@
+.env
+data/
+node_modules/
+web/dist/
+web/.vite/
+api/web/dist/*
+!api/web/dist/.gitkeep
+__pycache__/
+*.py[cod]
+*.sqlite*
+*.log
+*.wav
+coverage.out
+*.exe
+*.tsbuildinfo
+api/data-test/
