@@ -20,6 +20,27 @@ type PronunciationResult = {
   words?: { word: string; accuracy: number; phonemes?: { phoneme: string; accuracy: number }[] }[];
 };
 
+type RecordingSession = {
+  cardId: string;
+  expected: string;
+  pressed: boolean;
+  cancelled: boolean;
+  stream: MediaStream | null;
+  recorder: MediaRecorder | null;
+  chunks: BlobPart[];
+};
+
+function stopStream(stream: MediaStream | null) {
+  stream?.getTracks().forEach((track) => track.stop());
+}
+
+function cancelRecordingSession(session: RecordingSession) {
+  session.cancelled = true;
+  session.pressed = false;
+  if (session.recorder?.state === 'recording') session.recorder.stop();
+  else stopStream(session.stream);
+}
+
 const queueKey = 'wordwell.queue.v1';
 const navItems: { id: View; label: string; icon: string }[] = [
   { id: 'review', label: '复习', icon: '◷' },
@@ -254,13 +275,34 @@ function Brand() { return <div className="brand"><span className="brand-mark">W<
 
 function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { cards: Card[]; allCount: number; totalToday: number; onRate: (card: Card, rating: number) => Promise<void>; onAdd: () => void; notify: (message: string) => void }) {
   const [revealed, setRevealed] = useState(false);
+  const [startingRecording, setStartingRecording] = useState(false);
   const [recording, setRecording] = useState(false);
   const [checking, setChecking] = useState(false);
   const [ratingSaving, setRatingSaving] = useState(false);
   const [result, setResult] = useState<PronunciationResult | null>(null);
   const [played, setPlayed] = useState(false);
+  const recordingSessionRef = useRef<RecordingSession | null>(null);
   const current = cards[0];
-  useEffect(() => { setRevealed(false); setResult(null); setPlayed(false); }, [current?.id]);
+  useEffect(() => {
+    const session = recordingSessionRef.current;
+    if (session && session.cardId !== current?.id) {
+      cancelRecordingSession(session);
+      recordingSessionRef.current = null;
+      setStartingRecording(false);
+      setRecording(false);
+      setChecking(false);
+    }
+    setRevealed(false);
+    setResult(null);
+    setPlayed(false);
+  }, [current?.id]);
+  useEffect(() => () => {
+    const session = recordingSessionRef.current;
+    if (session) {
+      cancelRecordingSession(session);
+      recordingSessionRef.current = null;
+    }
+  }, []);
   const submitRating = (rating: number) => {
     if (!current || ratingSaving) return;
     setRatingSaving(true);
@@ -278,41 +320,107 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
     } catch (error) { notify((error as Error).message || 'TTS 暂不可用；请检查 AI 服务与模型状态'); }
   };
 
-  const recordAndAssess = async () => {
+  const startRecording = async () => {
+    if (recordingSessionRef.current || checking) return;
     if (!current || !navigator.mediaDevices?.getUserMedia || !('MediaRecorder' in window)) {
       notify('当前浏览器不支持录音；iPhone 请使用 HTTPS 或本机地址打开');
       return;
     }
+    const session: RecordingSession = {
+      cardId: current.id,
+      expected: current.word,
+      pressed: true,
+      cancelled: false,
+      stream: null,
+      recorder: null,
+      chunks: [],
+    };
+    recordingSessionRef.current = session;
+    setStartingRecording(true);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      session.stream = stream;
+      if (session.cancelled || !session.pressed || recordingSessionRef.current !== session) {
+        stopStream(stream);
+        return;
+      }
       const mime = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].find((type) => MediaRecorder.isTypeSupported(type));
       const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
-      const chunks: BlobPart[] = [];
-      setRecording(true);
-      recorder.ondataavailable = (event) => { if (event.data.size > 0) chunks.push(event.data); };
-      recorder.onerror = () => { stream.getTracks().forEach((track) => track.stop()); setRecording(false); setResult(null); notify('录音失败，请检查麦克风权限后重试'); };
-      recorder.onstop = async () => {
-        stream.getTracks().forEach((track) => track.stop());
+      session.recorder = recorder;
+      recorder.ondataavailable = (event) => { if (event.data.size > 0) session.chunks.push(event.data); };
+      recorder.onerror = () => {
+        session.cancelled = true;
+        stopStream(stream);
+        if (recordingSessionRef.current === session) recordingSessionRef.current = null;
+        setStartingRecording(false);
         setRecording(false);
-        const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+        setChecking(false);
+        setResult(null);
+        notify('录音失败，请检查麦克风权限后重试');
+      };
+      recorder.onstop = async () => {
+        stopStream(stream);
+        if (session.cancelled) {
+          if (recordingSessionRef.current === session) recordingSessionRef.current = null;
+          return;
+        }
+        setStartingRecording(false);
+        setRecording(false);
         setChecking(true);
         try {
+          const blob = new Blob(session.chunks, { type: recorder.mimeType || 'audio/webm' });
           const normalized = await normalizeRecordingToWav(blob);
+          if (session.cancelled) return;
           const audioBase64 = await new Promise<string>((resolve, reject) => {
             const reader = new FileReader();
             reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
             reader.onerror = () => reject(new Error('无法读取录音'));
             reader.readAsDataURL(normalized);
           });
-          const assessed = await api<PronunciationResult>('/pronunciation', { method: 'POST', body: JSON.stringify({ expected: current.word, audioMime: normalized.type, audioBase64 }) });
-          setResult(assessed);
-          setRevealed(true);
-        } catch (error) { setResult(null); notify((error as Error).message || '读音评估失败，请检查 AI 模型和录音'); }
-        finally { setChecking(false); }
+          if (session.cancelled) return;
+          const assessed = await api<PronunciationResult>('/pronunciation', { method: 'POST', body: JSON.stringify({ expected: session.expected, audioMime: normalized.type, audioBase64 }) });
+          if (!session.cancelled) {
+            setResult(assessed);
+            setRevealed(true);
+          }
+        } catch (error) {
+          if (!session.cancelled) {
+            setResult(null);
+            notify((error as Error).message || '读音评估失败，请检查 AI 模型和录音');
+          }
+        } finally {
+          if (recordingSessionRef.current === session) recordingSessionRef.current = null;
+          if (!session.cancelled) setChecking(false);
+        }
       };
       recorder.start();
-      window.setTimeout(() => { if (recorder.state === 'recording') recorder.stop(); }, 5000);
-    } catch { setRecording(false); notify('无法访问麦克风，请允许浏览器使用麦克风后再试'); }
+      setStartingRecording(false);
+      setRecording(true);
+    } catch {
+      if (recordingSessionRef.current === session) {
+        session.cancelled = true;
+        stopStream(session.stream);
+        recordingSessionRef.current = null;
+        setStartingRecording(false);
+        setRecording(false);
+        notify('无法访问麦克风，请允许浏览器使用麦克风后再试');
+      }
+    }
+  };
+
+  const stopRecording = () => {
+    const session = recordingSessionRef.current;
+    if (!session || !session.pressed) return;
+    session.pressed = false;
+    if (!session.recorder) {
+      session.cancelled = true;
+      stopStream(session.stream);
+      recordingSessionRef.current = null;
+      setStartingRecording(false);
+      setRecording(false);
+      return;
+    }
+    if (session.recorder.state === 'recording') session.recorder.stop();
   };
 
   if (!current) return <section className="review-page"><div className="page-heading"><div><span className="eyebrow">DAILY PRACTICE</span><h1>复习</h1></div><span className="date-stamp">{new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).format(new Date())}</span></div><div className="empty-review"><div className="empty-orbit"><span>✓</span></div><span className="eyebrow">ALL CAUGHT UP</span><h2>今天的复习完成了</h2><p>{allCount === 0 ? '先把阅读中遇到的词语收进来，之后每天再回来复习。' : '新的复习卡片会按间隔自动出现。'}<br />给自己一点空白，再继续积累。</p><button className="button button-primary" onClick={onAdd}>＋ 收集一个新词</button></div><div className="review-tip"><span>✦</span><p>复习时尽量先回想，再翻开释义。诚实的反馈会让间隔更合适。</p></div></section>;
@@ -323,13 +431,60 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
     <article className={`flash-card ${revealed ? 'is-revealed' : ''}`}>
       <div className="flash-top"><span className="pill">{current.state === 'new' ? '新词' : '间隔复习'}</span><span className="card-index">{totalToday - cards.length + 1} / {totalToday}</span></div>
       <div className="word-face"><div className="word-title-row"><h2>{current.word}</h2><button className={`sound-button ${played ? 'played' : ''}`} onClick={playWord} aria-label="播放美式发音"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z" /><path d="M16 9a5 5 0 0 1 0 6" /><path d="M18.5 6.5a9 9 0 0 1 0 11" /></svg></button></div>{current.ipa && <span className="ipa">/{current.ipa}/ <small>US</small></span>}<span className="word-hint">先在心里回想它的意思</span></div>
-      {!revealed ? <div className="reveal-area"><button className="button button-primary reveal-button" onClick={() => setRevealed(true)}>查看释义 <span>↓</span></button><button className="mic-link" onClick={recordAndAssess} disabled={recording || checking}>{recording ? <><span className="record-dot" />正在录音…</> : checking ? '正在评估…' : '⌁ 录音并检查读音'}</button></div> : <div className="answer-face"><div className="answer-divider" /><h3>{current.definition || '还没有释义'}</h3>{current.contextMeaning && <p className="context-meaning">{current.contextMeaning}</p>}{current.contextText && <blockquote>{current.contextText}</blockquote>}{current.source && <span className="source-line">来源 · {current.source}</span>}{result ? <PronunciationFeedback result={result} onRetry={recordAndAssess} recording={recording} checking={checking} /> : <button className="pron-retry" onClick={recordAndAssess} disabled={recording || checking}>{recording ? '正在录音…' : checking ? '正在评估…' : '录音并检查读音'}</button>}<div className="rating-prompt">你这次回想得怎么样？</div><div className="rating-row"><button className="rating again" disabled={ratingSaving} onClick={() => submitRating(1)}><b>没想起</b><small>Again</small></button><button className="rating hard" disabled={ratingSaving} onClick={() => submitRating(2)}><b>很费力</b><small>Hard</small></button><button className="rating good" disabled={ratingSaving} onClick={() => submitRating(3)}><b>想起来了</b><small>Good</small></button><button className="rating easy" disabled={ratingSaving} onClick={() => submitRating(4)}><b>很轻松</b><small>Easy</small></button></div></div>}
+      {!revealed ? <div className="reveal-area"><button className="button button-primary reveal-button" onClick={() => setRevealed(true)} disabled={startingRecording || recording || checking}>查看释义 <span>↓</span></button><HoldToRecordButton className="mic-link" starting={startingRecording} recording={recording} checking={checking} onStart={startRecording} onStop={stopRecording} idleLabel="按住录音并检查读音" /></div> : <div className="answer-face"><div className="answer-divider" /><h3>{current.definition || '还没有释义'}</h3>{current.contextMeaning && <p className="context-meaning">{current.contextMeaning}</p>}{current.contextText && <blockquote>{current.contextText}</blockquote>}{current.source && <span className="source-line">来源 · {current.source}</span>}{result ? <PronunciationFeedback result={result} onRetry={startRecording} onStop={stopRecording} starting={startingRecording} recording={recording} checking={checking} /> : <HoldToRecordButton className="pron-retry" starting={startingRecording} recording={recording} checking={checking} onStart={startRecording} onStop={stopRecording} idleLabel="按住录音并检查读音" />}<div className="rating-prompt">你这次回想得怎么样？</div><div className="rating-row"><button className="rating again" disabled={ratingSaving || startingRecording || recording || checking} onClick={() => submitRating(1)}><b>没想起</b><small>Again</small></button><button className="rating hard" disabled={ratingSaving || startingRecording || recording || checking} onClick={() => submitRating(2)}><b>很费力</b><small>Hard</small></button><button className="rating good" disabled={ratingSaving || startingRecording || recording || checking} onClick={() => submitRating(3)}><b>想起来了</b><small>Good</small></button><button className="rating easy" disabled={ratingSaving || startingRecording || recording || checking} onClick={() => submitRating(4)}><b>很轻松</b><small>Easy</small></button></div></div>}
     </article>
     <div className="review-footnote"><span>⟳</span><span>使用 FSRS 间隔重复 · 每次评分都会更新下次复习时间</span></div>
   </section>;
 }
 
-function PronunciationFeedback({ result, onRetry, recording, checking }: { result: PronunciationResult; onRetry: () => void; recording: boolean; checking: boolean }) {
+function HoldToRecordButton({ className, starting, recording, checking, onStart, onStop, idleLabel }: { className: string; starting: boolean; recording: boolean; checking: boolean; onStart: () => void; onStop: () => void; idleLabel: string }) {
+  const active = useRef<{ kind: 'pointer'; pointerId: number } | { kind: 'keyboard' } | null>(null);
+  const begin = (source: 'pointer' | 'keyboard', pointerId?: number) => {
+    if (checking || active.current) return;
+    active.current = source === 'pointer' ? { kind: 'pointer', pointerId: pointerId ?? -1 } : { kind: 'keyboard' };
+    onStart();
+  };
+  const end = (source?: 'pointer' | 'keyboard', pointerId?: number) => {
+    const held = active.current;
+    if (!held) return;
+    if (source === 'pointer' && (held.kind !== 'pointer' || held.pointerId !== pointerId)) return;
+    if (source === 'keyboard' && held.kind !== 'keyboard') return;
+    active.current = null;
+    onStop();
+  };
+  const busy = starting || recording || checking;
+  const label = starting ? '正在连接麦克风，松开取消' : recording ? '正在录音，松开结束' : checking ? '正在评估…' : idleLabel;
+
+  return <button
+    className={`${className}${recording ? ' is-recording' : ''}`}
+    type="button"
+    disabled={checking}
+    aria-label={label}
+    aria-pressed={starting || recording}
+    onPointerDown={(event) => {
+      if (event.button !== 0) return;
+      try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* Continue with bubbling pointer events. */ }
+      begin('pointer', event.pointerId);
+    }}
+    onPointerUp={(event) => end('pointer', event.pointerId)}
+    onPointerCancel={(event) => end('pointer', event.pointerId)}
+    onLostPointerCapture={(event) => end('pointer', event.pointerId)}
+    onKeyDown={(event) => {
+      if (event.code !== 'Space' && event.code !== 'Enter') return;
+      event.preventDefault();
+      if (!event.repeat) begin('keyboard');
+    }}
+    onKeyUp={(event) => {
+      if (event.code !== 'Space' && event.code !== 'Enter') return;
+      event.preventDefault();
+      end('keyboard');
+    }}
+    onBlur={() => end()}
+    onContextMenu={(event) => event.preventDefault()}
+  >{recording ? <><span className="record-dot" />正在录音，松开结束</> : busy ? label : idleLabel}</button>;
+}
+
+function PronunciationFeedback({ result, onRetry, onStop, starting, recording, checking }: { result: PronunciationResult; onRetry: () => void; onStop: () => void; starting: boolean; recording: boolean; checking: boolean }) {
   const localPhoneme = result.method === 'local-phoneme-assessment';
   const scored = localPhoneme || result.method === 'azure-pronunciation-assessment';
   const title = result.status === 'recognized'
@@ -370,7 +525,7 @@ function PronunciationFeedback({ result, onRetry, recording, checking }: { resul
       </div>)}
     </div>}
     <p>{result.notice}</p>
-    <button className="pron-retry" onClick={onRetry} disabled={recording || checking}>{recording ? '正在录音…' : checking ? '正在评估…' : '重新录音并评估'}</button>
+    <HoldToRecordButton className="pron-retry" starting={starting} recording={recording} checking={checking} onStart={onRetry} onStop={onStop} idleLabel="按住录音并重新评估" />
   </div>;
 }
 

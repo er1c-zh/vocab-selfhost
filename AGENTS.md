@@ -62,7 +62,7 @@ flowchart LR
 - **api/main.go** 使用 Go 标准库 HTTP 服务，同时提供嵌入式 Web UI、词卡与词典 API，以及到 AI 服务的代理。当前为单用户自托管形态，没有鉴权中间件。
 - **api/types.go** 定义 API 和备份用的数据结构；修改字段时检查 Web TypeScript 类型与导入/导出兼容性。
 - **api/store.go** 负责 SQLite schema、初始化词典、词卡和词典查询、复习事件、导入导出。SQLite 驱动为纯 Go 的 modernc.org/sqlite。
-- **api/pronunciation.go** 将发音请求路由到本地 AI 服务或 Azure Speech REST；Azure Key 和区域保存在 SQLite 设置中，Key 不返回给浏览器。浏览器录音转为 16 kHz 单声道 PCM WAV；本地结果含 ASR 转写、音素/单词分数或明确的 ASR 回退说明，Azure 结果由 Go API 归一化。发音模型状态和准备请求经 GET/POST `/api/pronunciation/model` 代理到 AI 服务。
+- **api/pronunciation.go** 将发音请求路由到本地 AI 服务或 Azure Speech REST；Azure Key 和区域保存在 SQLite 设置中，Key 不返回给浏览器。复习页按住发音按钮开始录音，松开后停止并提交评估；键盘用户可按住空格或回车，切页时清理录音流。浏览器录音转为 16 kHz 单声道 PCM WAV；本地结果含 ASR 转写、音素/单词分数或明确的 ASR 回退说明，Azure 结果由 Go API 归一化。发音模型状态和准备请求经 GET/POST `/api/pronunciation/model` 代理到 AI 服务。
 - **api/fsrs.go** 实现 FSRS-4.5 默认参数与排程。目标保留率为 90%，评分范围是 1–4，当前间隔最少一天、最多 36500 天。
 - review event 使用唯一事件 ID；重放同一评分请求时按事件 ID 去重，支撑离线操作重放。
 - 批量收词请求记录在 batch_requests 表（request_id 主键 + 响应 JSON），重放同一请求返回首次结果；每请求上限 50 条。同一词 + 同一段 contextText 视为重复，不重建词卡；同词不同语境会新建词卡。

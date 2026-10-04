@@ -75,6 +75,8 @@ h1, h2, h3, p { margin-top: 0; }
 .reveal-button { min-width: 178px; }
 .mic-link { min-height: 31px; border: 0; background: transparent; color: #74857b; font-size: 10px; }
 .mic-link:hover { color: #183c36; }
+.mic-link, .pron-retry { cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.mic-link.is-recording, .pron-retry.is-recording { border-color: #e7c9bd; background: #fff6f2; color: #a65445; }
 .record-dot { display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: #cf725f; box-shadow: 0 0 0 4px #fae7e2; }
 .answer-face { padding: 0 13px; }
 .answer-divider { width: 100%; height: 1px; margin: 0 auto 21px; background: #eef0ec; }
