@@ -75,10 +75,18 @@ h1, h2, h3, p { margin-top: 0; }
 .word-face .ipa { margin-top: 8px; }
 .ipa small { display: inline-block; margin-left: 4px; padding: 3px 5px; border-radius: 4px; background: #f2f4f0; color: #8c988f; font-size: 7px; letter-spacing: .5px; vertical-align: 1px; }
 .word-hint { margin-top: 28px; color: #a3aaa3; font-size: 10px; }
-.reveal-area { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 3px 0 6px; }
-.reveal-button { min-width: 178px; }
+.reveal-area { display: flex; flex-direction: column; align-items: center; gap: 7px; width: 100%; padding: 3px 0 6px; }
+.review-action-row { display: grid; grid-template-columns: minmax(96px, 1fr) 58px 72px; align-items: start; justify-content: center; gap: 8px; width: min(100%, 380px); }
+.reveal-button { width: 100%; min-width: 0; min-height: 50px; padding: 0 8px; }
+.review-action-slot { display: flex; flex-direction: column; align-items: center; gap: 4px; color: #74857b; font-size: 8px; line-height: 1.2; }
+.sound-button.review-sound-button { width: 50px; height: 50px; }
+.sound-button.review-sound-button svg { width: 22px; height: 22px; }
+.review-actions-hint { color: #99a39b; font-size: 8px; line-height: 1.4; text-align: center; }
 .hold-record-control { display: flex; align-items: center; gap: 10px; }
-.hold-record-control.mic-link { flex-direction: column; justify-content: center; gap: 8px; }
+.hold-record-control.mic-link { width: 72px; flex-direction: column; justify-content: center; gap: 4px; }
+.mic-link .hold-record-button { width: 50px; height: 50px; }
+.mic-link .hold-record-button svg { width: 22px; height: 22px; }
+.mic-link .hold-record-label { color: #74857b; font-size: 8px; line-height: 1.2; }
 .hold-record-control.pron-retry { grid-column: 1 / -1; justify-self: center; align-items: center; margin-top: 4px; }
 .hold-record-button { position: relative; display: grid; place-items: center; width: 58px; height: 58px; padding: 0; border: 1px solid #d5e2d7; border-radius: 50%; background: #eff6ef; color: #46735a; box-shadow: 0 3px 10px #47684d12; cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; transition: transform .15s, background .15s, box-shadow .15s; }
 .hold-record-button svg { width: 25px; height: 25px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }

@@ -36,11 +36,17 @@ function setMicStreamEnabled(stream: MediaStream | null, enabled: boolean) {
   stream?.getAudioTracks().forEach((track) => { track.enabled = enabled; });
 }
 
+function releaseMicStream(stream: MediaStream | null) {
+  if (!stream) return;
+  stream.getTracks().forEach((track) => track.stop());
+  if (reusableMicStream === stream) reusableMicStream = null;
+}
+
 function cancelRecordingSession(session: RecordingSession) {
   session.cancelled = true;
   session.pressed = false;
   if (session.recorder?.state === 'recording') session.recorder.stop();
-  else setMicStreamEnabled(session.stream, false);
+  releaseMicStream(session.stream);
 }
 
 const queueKey = 'wordwell.queue.v1';
@@ -345,6 +351,7 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
         cancelRecordingSession(session);
         recordingSessionRef.current = null;
       }
+      releaseMicStream(reusableMicStream);
       speechAudioRef.current?.pause();
       speechAudioRef.current = null;
       if (speechUrlRef.current) URL.revokeObjectURL(speechUrlRef.current);
@@ -401,6 +408,8 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
     }
   };
 
+  const speechButton = <button className={`sound-button${revealed ? '' : ' review-sound-button'} ${played ? 'played' : ''}${speechState === 'loading' ? ' is-loading' : ''}`} onClick={playWord} disabled={speechState !== 'idle'} aria-label={speechState === 'loading' ? '正在生成美式发音' : speechState === 'playing' ? '正在播放美式发音' : '播放美式发音'}><SpeakerGlyph /></button>;
+
   const startRecording = async () => {
     if (recordingSessionRef.current || checking) return;
     if (!current || !navigator.mediaDevices?.getUserMedia || !('MediaRecorder' in window)) {
@@ -426,7 +435,7 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
       }
       session.stream = stream;
       if (session.cancelled || !session.pressed || recordingSessionRef.current !== session) {
-        setMicStreamEnabled(stream, false);
+        releaseMicStream(stream);
         return;
       }
       setMicStreamEnabled(stream, true);
@@ -436,7 +445,7 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
       recorder.ondataavailable = (event) => { if (event.data.size > 0) session.chunks.push(event.data); };
       recorder.onerror = () => {
         session.cancelled = true;
-        setMicStreamEnabled(stream, false);
+        releaseMicStream(stream);
         if (recordingSessionRef.current === session) recordingSessionRef.current = null;
         setStartingRecording(false);
         setRecording(false);
@@ -445,7 +454,7 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
         notify('录音失败，请检查麦克风权限后重试');
       };
       recorder.onstop = async () => {
-        setMicStreamEnabled(stream, false);
+        releaseMicStream(stream);
         if (session.cancelled) {
           if (recordingSessionRef.current === session) recordingSessionRef.current = null;
           return;
@@ -484,7 +493,7 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
     } catch {
       if (recordingSessionRef.current === session) {
         session.cancelled = true;
-        setMicStreamEnabled(session.stream, false);
+        releaseMicStream(session.stream);
         recordingSessionRef.current = null;
         setStartingRecording(false);
         setRecording(false);
@@ -510,7 +519,7 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
     session.pressed = false;
     if (!session.recorder) {
       session.cancelled = true;
-      setMicStreamEnabled(session.stream, false);
+      releaseMicStream(session.stream);
       recordingSessionRef.current = null;
       setStartingRecording(false);
       setRecording(false);
@@ -527,12 +536,16 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
     <div className="review-progress"><div className="progress-label"><span>今日进度</span><b>{totalToday - cards.length} <i>/</i> {totalToday}</b></div><div className="progress-track"><i style={{ width: `${totalToday ? Math.max(4, ((totalToday - cards.length) / totalToday) * 100) : 100}%` }} /></div></div>
     <article className={`flash-card ${revealed ? 'is-revealed' : ''}`}>
       <div className="flash-top"><span className="pill">{current.state === 'new' ? '新词' : '间隔复习'}</span><span className="card-index">{totalToday - cards.length + 1} / {totalToday}</span></div>
-      <div className="word-face"><div className="word-title-row"><h2>{current.word}</h2><button className={`sound-button ${played ? 'played' : ''}${speechState === 'loading' ? ' is-loading' : ''}`} onClick={playWord} disabled={speechState !== 'idle'} aria-label={speechState === 'loading' ? '正在生成美式发音' : speechState === 'playing' ? '正在播放美式发音' : '播放美式发音'}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z" /><path d="M16 9a5 5 0 0 1 0 6" /><path d="M18.5 6.5a9 9 0 0 1 0 11" /></svg></button></div>{current.ipa && <span className="ipa">/{current.ipa}/ <small>US</small></span>}<span className="word-hint">先在心里回想它的意思</span></div>
+      <div className="word-face"><div className="word-title-row"><h2>{current.word}</h2>{revealed && speechButton}</div>{current.ipa && <span className="ipa">/{current.ipa}/ <small>US</small></span>}<span className="word-hint">先在心里回想它的意思</span></div>
       {!revealed ? (
         <>
           <div className="reveal-area">
-            <button className="button button-primary reveal-button" onClick={() => setRevealed(true)} disabled={startingRecording || recording || checking}>查看释义 <span>↓</span></button>
-            {!result && <HoldToRecordButton className="mic-link" starting={startingRecording} recording={recording} checking={checking} canceling={cancelingRecording} onStart={startRecording} onStop={stopRecording} onCancel={cancelCurrentRecording} onCancelingChange={setCancelingRecording} idleLabel="按住说出单词，松开提交评估" />}
+            <div className="review-action-row">
+              <button className="button button-primary reveal-button" onClick={() => setRevealed(true)} disabled={startingRecording || recording || checking}>查看释义</button>
+              <div className="review-action-slot">{speechButton}<span>朗读</span></div>
+              {!result && <HoldToRecordButton className="mic-link" starting={startingRecording} recording={recording} checking={checking} canceling={cancelingRecording} onStart={startRecording} onStop={stopRecording} onCancel={cancelCurrentRecording} onCancelingChange={setCancelingRecording} idleLabel="按住录音" />}
+            </div>
+            <span className="review-actions-hint">松开提交评估 · 向上滑动取消</span>
           </div>
           {result && <PronunciationFeedback result={result} onRetry={startRecording} onStop={stopRecording} onCancel={cancelCurrentRecording} onCancelingChange={setCancelingRecording} starting={startingRecording} recording={recording} checking={checking} canceling={cancelingRecording} />}
         </>
