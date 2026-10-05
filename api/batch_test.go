@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -279,8 +280,17 @@ func TestBatchCollectUsesAIGlossForUnknownWords(t *testing.T) {
 func TestBatchCollectPrefersUserSuppliedContent(t *testing.T) {
 	glossRequests := 0
 	ai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		glossRequests++
-		writeJSON(w, 200, map[string]string{"definition": "AI gloss that must not override the user"})
+		if r.URL.Path == "/v1/gloss" {
+			glossRequests++
+			writeJSON(w, 200, map[string]string{"definition": "AI gloss that must not override the user"})
+			return
+		}
+		if r.URL.Path == "/v1/tts" {
+			wav := append([]byte("RIFF"), make([]byte, 40)...)
+			writeJSON(w, 200, map[string]string{"audioBase64": base64.StdEncoding.EncodeToString(wav)})
+			return
+		}
+		http.NotFound(w, r)
 	}))
 	defer ai.Close()
 

@@ -8,11 +8,13 @@ services:
     environment:
       APP_ADDR: :8080
       APP_DATA_DIR: /data
+      AUDIO_DIR: /audio
       AI_SERVICE_URL: http://ai:8000
     ports:
       - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8080}:8080"
     volumes:
       - vocab-data:/data
+      - ${AUDIO_STORAGE_PATH:-vocab-audio}:/audio
     depends_on:
       ai:
         condition: service_healthy
@@ -39,7 +41,7 @@ services:
       AI_TEXT_MODEL: ${AI_TEXT_MODEL:-qwen2.5:3b}
       AI_TEXT_API_KEY: ${AI_TEXT_API_KEY:-}
     volumes:
-      - ai-models:/models
+      - ${AI_MODEL_STORAGE_PATH:-ai-models}:/models
     expose:
       - "8000"
     healthcheck:
@@ -78,6 +80,7 @@ services:
 
 volumes:
   vocab-data:
+  vocab-audio:
   ai-models:
   ollama-models:
   caddy-data:

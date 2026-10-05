@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import base64
+from collections import deque
 import importlib.util
 import io
 import json
 import math
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -17,20 +19,130 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
 MAX_BODY = 16 * 1024 * 1024
 _tts_lock = threading.Lock()
 _asr_lock = threading.Lock()
+_asr_status_lock = threading.Lock()
 _phoneme_lock = threading.Lock()
 _phoneme_status_lock = threading.Lock()
 _tts_inference_lock = threading.Lock()
 _asr_inference_lock = threading.Lock()
 _phoneme_inference_lock = threading.Lock()
 _tts_pipeline: Any = None
+_tts_status_lock = threading.Lock()
+_tts_status: dict[str, str] = {"state": "idle", "error": ""}
 _asr_model: Any = None
+_asr_status: dict[str, str] = {"state": "idle", "error": ""}
 _phoneme_model: Any = None
 _phoneme_status: dict[str, str] = {"state": "idle", "error": ""}
+_task_stats_lock = threading.Lock()
+_task_stats: dict[str, dict[str, Any]] = {}
+_metrics_lock = threading.Lock()
+_metrics_previous = (time.monotonic(), time.process_time())
+_log_stream: RingLogStream | None = None
+
+
+class RingLogStream:
+    """Tee Python process output to the container and a bounded in-memory log."""
+
+    def __init__(self, stream: Any, max_lines: int = 1000) -> None:
+        self.stream = stream
+        self.lines: deque[str] = deque(maxlen=max_lines)
+        self.pending = ""
+        self.lock = threading.Lock()
+
+    def write(self, value: str) -> int:
+        if not value:
+            return 0
+        with self.lock:
+            result = self.stream.write(value)
+            self.stream.flush()
+            self.pending += value
+            while "\n" in self.pending:
+                line, self.pending = self.pending.split("\n", 1)
+                line = line.rstrip("\r")
+                if line:
+                    self.lines.append(line[-4000:])
+            return len(value) if result is None else result
+
+    def flush(self) -> None:
+        with self.lock:
+            self.stream.flush()
+
+    def snapshot(self, limit: int = 300) -> list[str]:
+        with self.lock:
+            lines = list(self.lines)
+            if self.pending.strip():
+                lines.append(self.pending.strip()[-4000:])
+            return lines[-max(1, min(limit, 500)):]
+
+
+def _task_started(name: str) -> None:
+    with _task_stats_lock:
+        item = _task_stats.setdefault(name, {"running": 0, "requests": 0, "completed": 0, "failed": 0, "totalDurationSeconds": 0.0, "lastDurationSeconds": 0.0})
+        item["running"] += 1
+        item["requests"] += 1
+
+
+def _task_finished(name: str, duration: float, succeeded: bool) -> None:
+    with _task_stats_lock:
+        item = _task_stats.setdefault(name, {"running": 0, "requests": 0, "completed": 0, "failed": 0, "totalDurationSeconds": 0.0, "lastDurationSeconds": 0.0})
+        item["running"] = max(0, item["running"] - 1)
+        item["completed" if succeeded else "failed"] += 1
+        item["totalDurationSeconds"] += duration
+        item["lastDurationSeconds"] = duration
+
+
+def _read_proc_status() -> dict[str, int]:
+    result: dict[str, int] = {}
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith(("VmRSS:", "VmSize:")):
+                parts = line.split()
+                result[parts[0].rstrip(":")] = int(parts[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return result
+
+
+def _read_cgroup_memory() -> dict[str, int | None]:
+    result: dict[str, int | None] = {"usageBytes": None, "limitBytes": None}
+    for usage_path, limit_path in (
+        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+        ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ):
+        try:
+            usage = int(Path(usage_path).read_text().strip())
+            raw_limit = Path(limit_path).read_text().strip()
+            limit = None if raw_limit == "max" else int(raw_limit)
+            result = {"usageBytes": usage, "limitBytes": limit}
+            break
+        except (OSError, ValueError):
+            continue
+    return result
+
+
+def metrics_snapshot() -> dict[str, Any]:
+    global _metrics_previous
+    now_wall = time.monotonic()
+    now_cpu = time.process_time()
+    with _metrics_lock:
+        previous_wall, previous_cpu = _metrics_previous
+        _metrics_previous = (now_wall, now_cpu)
+    elapsed = now_wall - previous_wall
+    cpu_percent = round(max(0.0, (now_cpu - previous_cpu) / elapsed * 100), 1) if elapsed > 0 else None
+    status = _read_proc_status()
+    with _task_stats_lock:
+        tasks = {name: dict(item) for name, item in _task_stats.items()}
+    return {
+        "process": {"pid": os.getpid(), "rssBytes": status.get("VmRSS"), "virtualBytes": status.get("VmSize"), "cpuPercent": cpu_percent, "cpuSeconds": now_cpu},
+        "containerMemory": _read_cgroup_memory(),
+        "models": {"tts": tts_model_status(), "asr": asr_model_status(), "pronunciation": pronunciation_model_status(), "asrLoaded": _asr_model is not None, "phonemeScorerLoaded": _phoneme_model is not None},
+        "tasks": tasks,
+    }
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -79,10 +191,47 @@ def _load_tts() -> Any:
         return _tts_pipeline
     with _tts_lock:
         if _tts_pipeline is None:
-            from kokoro import KPipeline
+            _set_tts_status("loading")
+            try:
+                from kokoro import KPipeline
 
-            _tts_pipeline = KPipeline(lang_code="a", device="cpu")
+                _tts_pipeline = KPipeline(lang_code="a", device="cpu")
+            except Exception as exc:
+                _set_tts_status("failed", f"{type(exc).__name__}: {exc}")
+                raise
+            _set_tts_status("ready")
     return _tts_pipeline
+
+
+def _set_tts_status(state: str, error: str = "") -> None:
+    with _tts_status_lock:
+        _tts_status.update(state=state, error=error)
+
+
+def tts_model_status() -> dict[str, str]:
+    with _tts_status_lock:
+        return dict(_tts_status)
+
+
+def _preload_models_on_startup() -> None:
+    """Load all long-lived speech models once, in sequence, after HTTP starts."""
+    loaders = (
+        ("Kokoro TTS", _load_tts),
+        ("faster-whisper ASR", _load_asr),
+        ("Whisper Phoneme CTC", _load_phoneme_scorer),
+    )
+    for name, loader in loaders:
+        started = time.perf_counter()
+        try:
+            loader()
+        except Exception as exc:
+            print(
+                f"Startup model preload failed: model={name} duration={time.perf_counter() - started:.3f}s "
+                f"error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        else:
+            print(f"Startup model preload ready: model={name} duration={time.perf_counter() - started:.3f}s", flush=True)
 
 
 def synthesize(text: str, voice: str) -> bytes:
@@ -90,26 +239,60 @@ def synthesize(text: str, voice: str) -> bytes:
         raise ValueError("text must contain 1-1000 characters")
     if not re.fullmatch(r"a[fm]_[a-z0-9_]+", voice):
         raise ValueError("voice must be a Kokoro American English voice such as af_heart")
-    import numpy as np
+    started = time.perf_counter()
+    model_started = time.perf_counter()
+    model_load_s = 0.0
+    inference_queue_s = 0.0
+    inference_s = 0.0
+    encode_s = 0.0
+    audio_bytes = 0
+    status = "error"
+    try:
+        import numpy as np
 
-    pipeline = _load_tts()
-    chunks = []
-    with _tts_inference_lock:
-        for _graphemes, _phonemes, audio in pipeline(text, voice=voice, split_pattern=r"\n+"):
-            if audio is not None:
-                chunks.append(np.asarray(audio.detach().cpu().numpy(), dtype=np.float32).reshape(-1))
-    if not chunks:
-        raise RuntimeError("Kokoro did not return audio")
-    samples = np.clip(np.concatenate(chunks), -1.0, 1.0)
-    pcm = (samples * 32767).astype("<i2").tobytes()
-    with tempfile.SpooledTemporaryFile() as buffer:
-        with wave.open(buffer, "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(24000)
-            wav.writeframes(pcm)
-        buffer.seek(0)
-        return buffer.read()
+        try:
+            pipeline = _load_tts()
+        finally:
+            model_load_s = time.perf_counter() - model_started
+        chunks = []
+        queue_started = time.perf_counter()
+        with _tts_inference_lock:
+            inference_started = time.perf_counter()
+            inference_queue_s = inference_started - queue_started
+            try:
+                for _graphemes, _phonemes, audio in pipeline(text, voice=voice, split_pattern=r"\n+"):
+                    if audio is not None:
+                        chunks.append(np.asarray(audio.detach().cpu().numpy(), dtype=np.float32).reshape(-1))
+            finally:
+                inference_s = time.perf_counter() - inference_started
+        if not chunks:
+            raise RuntimeError("Kokoro did not return audio")
+        encode_started = time.perf_counter()
+        samples = np.clip(np.concatenate(chunks), -1.0, 1.0)
+        pcm = (samples * 32767).astype("<i2").tobytes()
+        with tempfile.SpooledTemporaryFile() as buffer:
+            with wave.open(buffer, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(24000)
+                wav.writeframes(pcm)
+            buffer.seek(0)
+            result = buffer.read()
+        encode_s = time.perf_counter() - encode_started
+        audio_bytes = len(result)
+        status = "ok"
+        return result
+    finally:
+        print(
+            "TTS timing: "
+            f"model_load_s={model_load_s:.3f}s "
+            f"inference_queue_s={inference_queue_s:.3f}s "
+            f"inference_s={inference_s:.3f}s "
+            f"encode_s={encode_s:.3f}s "
+            f"total_s={time.perf_counter() - started:.3f}s "
+            f"chars={len(text)} audio_bytes={audio_bytes} result={status}",
+            flush=True,
+        )
 
 
 def _load_asr() -> Any:
@@ -118,13 +301,29 @@ def _load_asr() -> Any:
         return _asr_model
     with _asr_lock:
         if _asr_model is None:
-            from faster_whisper import WhisperModel
+            _set_asr_status("loading")
+            try:
+                from faster_whisper import WhisperModel
 
-            cache = Path(os.getenv("AI_CACHE_DIR", "/models")) / "whisper"
-            cache.mkdir(parents=True, exist_ok=True)
-            model_name = os.getenv("ASR_MODEL", "base.en")
-            _asr_model = WhisperModel(model_name, device="cpu", compute_type="int8", download_root=str(cache))
+                cache = Path(os.getenv("AI_CACHE_DIR", "/models")) / "whisper"
+                cache.mkdir(parents=True, exist_ok=True)
+                model_name = os.getenv("ASR_MODEL", "base.en")
+                _asr_model = WhisperModel(model_name, device="cpu", compute_type="int8", download_root=str(cache))
+            except Exception as exc:
+                _set_asr_status("failed", f"{type(exc).__name__}: {exc}")
+                raise
+            _set_asr_status("ready")
     return _asr_model
+
+
+def _set_asr_status(state: str, error: str = "") -> None:
+    with _asr_status_lock:
+        _asr_status.update(state=state, error=error)
+
+
+def asr_model_status() -> dict[str, str]:
+    with _asr_status_lock:
+        return dict(_asr_status)
 
 
 def _load_phoneme_scorer() -> Any:
@@ -183,6 +382,8 @@ def pronunciation_model_status() -> dict[str, Any]:
         "downloaded": cached or loaded,
         "loaded": loaded,
         "error": error if current == "failed" else "",
+        "asr": asr_model_status(),
+        "tts": tts_model_status(),
     }
 
 
@@ -405,30 +606,55 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "VocabAI/0.1"
 
     def do_GET(self) -> None:
-        if self.path == "/v1/pronunciation/model":
+        endpoint = urlsplit(self.path).path
+        if endpoint == "/v1/pronunciation/model":
             self._json(200, pronunciation_model_status())
             return
-        if self.path != "/healthz":
+        if endpoint == "/v1/metrics":
+            self._json(200, metrics_snapshot())
+            return
+        if endpoint == "/v1/logs":
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                limit = int(query.get("limit", ["300"])[0])
+            except ValueError:
+                limit = 300
+            self._json(200, _log_stream.snapshot(limit) if _log_stream is not None else [])
+            return
+        if endpoint != "/healthz":
             self._json(404, {"error": "not found"})
             return
         self._json(200, {
             "status": "ok",
+            "ttsModel": tts_model_status(),
+            "asrModel": asr_model_status(),
+            "pronunciationModel": pronunciation_model_status(),
             "features": {"kokoroInstalled": _has_module("kokoro"), "asrInstalled": _has_module("faster_whisper"), "phonemeScorerInstalled": _has_module("torchaudio") and _has_module("whisper"), "textAIEnabled": os.getenv("AI_TEXT_PROVIDER", "disabled") == "openai-compatible"},
         })
 
     def do_POST(self) -> None:
+        endpoint = urlsplit(self.path).path
+        task_name = {"/v1/tts": "tts", "/v1/pronunciation": "pronunciation", "/v1/gloss": "gloss", "/v1/pronunciation/model": "pronunciation-model"}.get(endpoint)
+        started = time.perf_counter()
+        if task_name:
+            _task_started(task_name)
+        succeeded = False
         try:
             payload = self._read_payload()
-            if self.path == "/v1/tts":
+            if endpoint == "/v1/tts":
                 audio = synthesize(str(payload.get("text", "")), str(payload.get("voice", "af_heart")))
                 self._json(200, {"audioBase64": base64.b64encode(audio).decode("ascii"), "format": "wav", "sampleRate": 24000, "provider": "kokoro"})
-            elif self.path == "/v1/pronunciation":
+                succeeded = True
+            elif endpoint == "/v1/pronunciation":
                 result = assess_audio(str(payload.get("expected", "")), str(payload.get("audioBase64", "")), str(payload.get("audioMime", "")))
                 self._json(200, result)
-            elif self.path == "/v1/pronunciation/model":
+                succeeded = True
+            elif endpoint == "/v1/pronunciation/model":
                 self._json(202, start_pronunciation_model_download())
-            elif self.path == "/v1/gloss":
+                succeeded = True
+            elif endpoint == "/v1/gloss":
                 self._json(200, generate_gloss(payload))
+                succeeded = True
             else:
                 self._json(404, {"error": "not found"})
         except ValueError as exc:
@@ -437,6 +663,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(503, {"error": f"required local model package is unavailable: {exc.name}"})
         except Exception as exc:  # Model load, network and decoder failures remain explicit.
             self._json(503, {"error": f"feature unavailable: {type(exc).__name__}: {exc}"})
+        finally:
+            if task_name:
+                _task_finished(task_name, time.perf_counter() - started, succeeded)
 
     def _read_payload(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -471,6 +700,11 @@ def _has_module(name: str) -> bool:
 if __name__ == "__main__":
     address = os.getenv("AI_ADDR", "0.0.0.0")
     port = int(os.getenv("AI_PORT", "8000"))
+    _log_stream = RingLogStream(sys.stdout)
+    sys.stdout = _log_stream
+    sys.stderr = _log_stream
+    http_server = ThreadingHTTPServer((address, port), Handler)
+    threading.Thread(target=_preload_models_on_startup, name="speech-model-preload", daemon=True).start()
     print(f"Vocab AI service listening on {address}:{port}")
-    ThreadingHTTPServer((address, port), Handler).serve_forever()
+    http_server.serve_forever()
 

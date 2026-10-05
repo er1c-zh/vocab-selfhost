@@ -18,5 +18,6 @@ COPY pronunciation_model.py /app/pronunciation_model.py
 COPY PHONEME_MODEL_LICENSE.txt /app/PHONEME_MODEL_LICENSE.txt
 USER 10002:10002
 EXPOSE 8000
+VOLUME ["/models"]
 CMD ["python", "/app/server.py"]
 

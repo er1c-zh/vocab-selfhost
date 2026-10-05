@@ -20,9 +20,10 @@ FROM alpine:3.22 AS runtime
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=api-build /out/vocab-api /app/vocab-api
-RUN mkdir -p /data && chown -R 10001:10001 /data /app
+RUN mkdir -p /data /audio && chown -R 10001:10001 /data /audio /app
 USER 10001:10001
-ENV APP_ADDR=:8080 APP_DATA_DIR=/data
+ENV APP_ADDR=:8080 APP_DATA_DIR=/data AUDIO_DIR=/audio
+VOLUME ["/data", "/audio"]
 EXPOSE 8080
 ENTRYPOINT ["/app/vocab-api"]
 

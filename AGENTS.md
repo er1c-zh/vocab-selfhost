@@ -2,7 +2,7 @@
 
 > 本文件供后续维护者和代码代理快速了解产品约束、系统结构与当前实现。内容依据仓库源码、README 和 Compose 配置整理；新增或修改功能时应以实际代码为准，并同步更新本文及用户文档。
 >
-> 状态核对日期：2026-10-04。
+> 状态核对日期：2026-10-05。
 
 ## 项目目标
 
@@ -13,7 +13,7 @@ Wordwell 是一套可自托管的英语词汇学习系统。核心场景是用�
 - 用响应式 PWA 支持桌面和手机上的新增、复习、搜索、编辑、删除与数据管理。
 - 由自托管 Go API 和 SQLite 保存词卡、复习记录与用户导入的词典。
 - 在有词典数据时提供 IPA 和释义；缺少词条时明确提示，不猜造 IPA 或释义。
-- 按需生成美式英语发音并缓存音频；提供本地音素/单词级练习评分、ASR 转写反馈和“不确定”结果。
+- 生成并持久化美式英语发音；新建词卡异步预生成，播放按钮请求优先进入合成队列；提供本地音素/单词级练习评分、ASR 转写反馈和“不确定”结果。
 - 释义 AI 是可选服务。基础词库、复习、备份和本地语音不依赖云端大模型 API。
 - 交付方式以 Docker 镜像和 Docker Compose 为主，数据写入命名卷。
 
@@ -51,7 +51,7 @@ flowchart LR
 
 ### Web UI
 
-- React + TypeScript + Vite；主要页面和用户流程位于 **web/src/App.tsx**，HTTP 与浏览器缓存辅助逻辑位于 **web/src/api.ts**，样式位于 **web/src/styles.css**。
+- React + TypeScript + Vite；主要页面和用户流程位于 **web/src/App.tsx**，HTTP 与浏览器缓存辅助逻辑位于 **web/src/api.ts**，样式位于 **web/src/styles.css**。侧栏和移动导航均提供“浏览”与“监控”入口；词库单词可打开逐张浏览。
 - **web/public/manifest.webmanifest** 和 **web/public/sw.js** 提供 PWA 元数据和应用壳缓存。
 - 服务端 UI 资源由 Docker 多阶段构建生成，再嵌入 Go 二进制。修改 Web UI 后，生产镜像构建必须经过根目录 **Dockerfile** 中的 Web build 阶段。
 - Service worker 缓存同源的静态 GET 请求；明确跳过 /api/ 请求。词卡缓存、词典缓存、登录令牌和待同步操作由 Web 代码存入浏览器 localStorage。
@@ -62,21 +62,24 @@ flowchart LR
 - **api/main.go** 使用 Go 标准库 HTTP 服务，同时提供嵌入式 Web UI、词卡与词典 API，以及到 AI 服务的代理。当前为单用户自托管形态，没有鉴权中间件。
 - **api/types.go** 定义 API 和备份用的数据结构；修改字段时检查 Web TypeScript 类型与导入/导出兼容性。
 - **api/store.go** 负责 SQLite schema、初始化词典、词卡和词典查询、复习事件、导入导出。SQLite 驱动为纯 Go 的 modernc.org/sqlite。
-- **api/pronunciation.go** 将发音请求路由到本地 AI 服务或 Azure Speech REST；Azure Key 和区域保存在 SQLite 设置中，Key 不返回给浏览器。复习页按住发音按钮开始录音，松开后停止并提交评估；键盘用户可按住空格或回车，切页时清理录音流。浏览器录音转为 16 kHz 单声道 PCM WAV；本地结果含 ASR 转写、音素/单词分数或明确的 ASR 回退说明，Azure 结果由 Go API 归一化。发音模型状态和准备请求经 GET/POST `/api/pronunciation/model` 代理到 AI 服务。
+- **api/pronunciation.go** 将发音请求路由到本地 AI 服务或 Azure Speech REST；Azure Key 和区域保存在 SQLite 设置中，Key 不返回给浏览器。复习页按住发音按钮开始录音，松开后停止并提交评估；手机上滑取消会丢弃录音，评估结果不会自动显示释义。麦克风流在应用页面存活期间复用，停止录音后禁用音轨，关闭页面时由浏览器回收流。键盘用户可按住空格或回车。浏览器录音转为 16 kHz 单声道 PCM WAV；本地结果含 ASR 转写、音素/单词分数或明确的 ASR 回退说明，Azure 结果由 Go API 归一化。发音模型状态和准备请求经 GET/POST `/api/pronunciation/model` 代理到 AI 服务。
+- **api/tts_queue.go** 管理串行 TTS 优先队列；新卡片使用后台优先级，播放器与设置页的手动试听请求排在所有等待任务之前，并合并相同文本/音色。正在运行的 Kokoro 推理不可中断。音频文件由 `AUDIO_DIR` 指定，Compose 默认挂载独立 `vocab-audio` 命名卷到 `/audio`；升级时会把旧 `/data/audio` 中的 WAV 迁移过去。
 - **api/fsrs.go** 实现 FSRS-4.5 默认参数与排程。目标保留率为 90%，评分范围是 1–4，当前间隔最少一天、最多 36500 天。
 - review event 使用唯一事件 ID；重放同一评分请求时按事件 ID 去重，支撑离线操作重放。
 - 批量收词请求记录在 batch_requests 表（request_id 主键 + 响应 JSON），重放同一请求返回首次结果；每请求上限 50 条。同一词 + 同一段 contextText 视为重复，不重建词卡；同词不同语境会新建词卡。
-- Compose 中应用数据目录为 /data：数据库是 /data/vocab.db，生成的 WAV 缓存在 /data/audio。两者均由 vocab-data 命名卷持久化。
+- Compose 中应用数据库位于 `/data/vocab.db`，由 `vocab-data` 持久化；生成的 WAV 是持久数据，默认写入独立挂载的 `/audio`，由 `vocab-audio` 持久化。通过 `.env` 的 `AUDIO_STORAGE_PATH` 可将宿主机路径（包括已挂载的 NAS 路径）映射到 `/audio`。
 - 当前 schema 通过 CREATE TABLE IF NOT EXISTS 初始化，没有独立版本化迁移框架。修改既有列或数据格式时，应设计兼容迁移并检查旧备份恢复路径。
 
 ### Python AI 服务
 
 - **ai/server.py** 是独立的轻量 HTTP 服务；Compose 网络内只由 Go API 调用，不直接发布宿主机端口。
-- Kokoro 在 CPU 上按需生成美式英语 WAV，默认 voice 为 af_heart。首次使用时可能下载模型权重。
-- 本地 faster-whisper 默认使用 base.en、CPU 和 int8；本地音素评分由 **ai/pronunciation_model.py** 加载固定 revision 的 Whisper Phoneme CTC、CMU 发音词典及其 GOP 回归器，在 0–2 模型尺度上计算音素并映射到 0–100 展示。设置页可以主动下载/加载约 96 MB 文件并显示模型状态；首次评分也会自动准备，文件缓存于 ai-models 卷。模型在每个 AI 进程中单例加载；同一段录音的多个词典读音候选复用一次 Whisper 声学编码，只分别执行音素对齐。单词短录音的 ASR 关闭 VAD 过滤，避免短语音被裁掉；模型或发音字典不可用时回退到 faster-whisper 转写比较并说明原因。AI 日志按请求输出 ASR、音频解码、模型加载、音素评分和总耗时，不记录录音或转写内容。Azure 模式由 Go API 直接调用 `en-US` 短音频发音评价 REST 接口。
+- Kokoro 在 CPU 上生成美式英语 WAV，默认 voice 为 af_heart。AI 进程启动后在后台依次预加载/下载 Kokoro、faster-whisper ASR 和 Whisper Phoneme CTC；成功加载后均在进程内单例复用到容器重启。健康检查可在加载期间响应，并返回三类模型状态。Go API 把新卡片和导入卡片的合成放入后台队列；网页播放请求插队到等待队列最前。同一缓存键请求合并，已生成 WAV 在人工清理前一直保留。日志记录队列优先级、推理时间、文件大小和传输时间，不记录单词文本。
+- AI 服务 `/v1/metrics` 返回进程 RSS/CPU、容器内存、模型状态与任务计数，`/v1/logs` 返回最近进程日志；Go API `/api/ops/metrics` 和 `/api/ops/logs` 汇总并提供给网页监控页。日志仅保留进程内最近记录，不代替 Docker 完整日志。
+- 本地 faster-whisper 默认使用 base.en、CPU 和 int8；本地音素评分由 **ai/pronunciation_model.py** 加载固定 revision 的 Whisper Phoneme CTC、CMU 发音词典及其 GOP 回归器，在 0–2 模型尺度上计算音素并映射到 0–100 展示。设置页显示 TTS、ASR 与音素评分模型状态，也可主动准备约 96 MB 的音素模型；AI 启动时会自动依次加载三种模型。模型权重缓存于 `/models`，默认挂到 ai-models 命名卷，可通过 `AI_MODEL_STORAGE_PATH` 映射到宿主机/NAS 绝对路径。模型在每个 AI 进程中单例加载；同一段录音的多个词典读音候选复用一次 Whisper 声学编码，只分别执行音素对齐。单词短录音的 ASR 关闭 VAD 过滤，避免短语音被裁掉；模型或发音字典不可用时回退到 faster-whisper 转写比较并说明原因。AI 日志按请求输出 ASR、音频解码、模型加载、音素评分和总耗时，不记录录音或转写内容。Azure 模式由 Go API 直接调用 `en-US` 短音频发音评价 REST 接口。
+- `faster-whisper==1.2.1` 使用 PyAV 的 `av.open(..., metadata_errors=...)` 参数；PyAV 19 已移除此参数，因此 `ai/requirements.txt` 固定 `av>=11,<19`，避免 ASR 音频解码失败。
 - 模型分数是研究模型的练习反馈，不能作为客观正确率或口音诊断；界面必须保留不确定状态，并区分本地音素分数、ASR 文本回退和 Azure 分数。CMU 多读音词会尝试可用读音并选模型分数最高的变体。
 - 文本释义默认关闭。可在 Web 设置页（保存于 SQLite settings 表）或通过 AI_TEXT_PROVIDER=openai-compatible 等 env 配置；Web 设置以 textAI 请求字段覆盖 env，UI 停用优先于 env 启用。API Key 只存服务器，GET /api/settings 仅返回掩码提示，不进入 JSON 备份。服务不可用、模型加载失败或响应格式异常时返回明确错误。
-- 模型缓存写入 Compose 的 ai-models 卷。AI 容器下载模型时需要能够访问 Hugging Face；`/api/pronunciation/model` 的 GET 查询状态，POST 在后台准备模型。
+- 模型缓存写入 Compose 的 ai-models 卷或 `AI_MODEL_STORAGE_PATH` 指定的宿主机目录。AI 容器下载模型时需要能够访问 Hugging Face；宿主机/NAS 目录需允许容器 UID 10002 读写。`/api/pronunciation/model` 的 GET 查询状态，POST 在后台准备音素评分模型。
 
 ## API 摘要
 
@@ -94,8 +97,11 @@ flowchart LR
 | GET /api/export | 导出包含词卡、复习记录和词典的 JSON 备份 |
 | GET、POST /api/sync | GET 返回服务端同步快照；POST 导入/合并快照 |
 | POST /api/import | 导入/合并 JSON 备份 |
-| POST /api/tts | 请求 Kokoro 生成语音；Go API 按 voice 与文本的哈希缓存 WAV |
-| GET /api/audio/{hash}.wav | 读取缓存的 WAV |
+| POST /api/tts | 高优先级合成请求；等待同一文本/音色任务完成后返回持久化 WAV URL |
+| GET /api/audio/{hash}.wav | 读取持久化 WAV，并记录文件传输耗时 |
+| GET、DELETE /api/audio | 查看持久化读音的目录、文件数和总大小；清理 WAV 文件并取消等待中的队列任务 |
+| GET /api/ops/metrics | 查看应用/AI 内存与 CPU、音频占用、模型状态、队列和任务统计 |
+| GET /api/ops/logs | 查看应用与 AI 服务保留的近期日志 |
 | POST /api/pronunciation | 请求本地音素评测（失败时回退 ASR 转写）或 Azure Speech 发音评分 |
 | GET、POST /api/pronunciation/model | 查询本地音素模型下载状态；后台下载并加载模型 |
 | GET、PUT /api/settings | 读取/保存 AI 文本释义配置（Key 只存服务器，返回掩码） |
@@ -116,7 +122,7 @@ flowchart LR
 - app 默认绑定 127.0.0.1:8080；面向 iPhone 使用时应通过已有反向代理提供 HTTPS。普通 HTTP 的局域网 IP 页面无法满足 PWA 离线能力和浏览器麦克风的安全上下文要求。
 - 启用 https profile 的 Caddy 会占用宿主机 80、443 TCP 和 443 UDP。部署到已有反向代理主机前先确认端口安排；不要在未检查现有服务的情况下启用该 profile。
 - Ollama profile 使用独立 ollama-models 卷。默认文本 AI 关闭，因此启用 Ollama 服务本身不会自动配置释义模型。
-- 命名卷：vocab-data 持久化 SQLite 和音频；ai-models 保存 Hugging Face/ASR 权重；ollama-models 保存 Ollama 模型；caddy-data 和 caddy-config 保存可选 Caddy 状态。
+- 命名卷：vocab-data 持久化 SQLite；vocab-audio 持久化 WAV（可由 `AUDIO_STORAGE_PATH` 改为宿主机/NAS 路径）；ai-models 保存 Hugging Face/ASR 权重（可由 `AI_MODEL_STORAGE_PATH` 改为宿主机/NAS 路径）；ollama-models 保存 Ollama 模型；caddy-data 和 caddy-config 保存可选 Caddy 状态。
 - .env 被 .gitignore 排除。不要读取、打印、记录或提交真实 AI API Key；文档示例只使用占位值。
 - 可本机构建镜像，或登录 GHCR 后拉取 Compose 指定镜像。详细操作、词典文件格式和用户备份流程以 **README.md** 为用户文档入口，**.env.example** 为配置项示例。
 
@@ -131,8 +137,9 @@ flowchart LR
 | 本地 SQLite、跨设备服务端同步和备份导入导出 | 已实现 |
 | FSRS-4.5 天级排程，四级评分 | 已实现；无日内步骤配置 |
 | 本地词典和 IPA | 已实现基础功能；内置词条很少，需自行导入完整词库 |
-| Kokoro 美式英语语音及 WAV 缓存 | 已实现按需调用；首次使用需下载模型 |
-| 录音识别和评分 | 默认本地 Whisper Phoneme CTC 返回词级/音素级分数并由 faster-whisper 转写；失败时回退文本匹配；设置页可预下载并查看模型状态；可选 Azure；都不是专业发音诊断 |
+| Kokoro 美式英语语音与持久化 WAV | 新卡片后台预生成、播放请求优先合成、持久化目录和清理入口已实现；设置页显示文件数/大小，监控页显示队列与任务状态 |
+| 卡片浏览、资源指标和日志 | 词库可进入单卡浏览，侧栏有“浏览”和“监控”；监控页查看容器资源、AI 模型/任务状态及应用/AI 近期日志 |
+| 录音识别和评分 | 默认本地 Whisper Phoneme CTC 返回词级/音素级分数并由 faster-whisper 转写；三类语音模型启动时依次预加载；结果与释义解耦；手机按住录音可上滑取消；设置页显示模型状态；可选 Azure；都不是专业发音诊断 |
 | 可选 Ollama 或兼容服务的 AI 释义 | 已实现可选接口；默认关闭，费用由用户配置的外部服务决定 |
 | PDF 搜索、PDF 阅读和自动提取 | 未实现，且不属于当前产品范围 |
 | 多用户、角色权限和用户隔离 | 未实现 |

@@ -77,7 +77,39 @@ export type PronunciationModelStatus = {
   downloaded: boolean;
   loaded: boolean;
   error: string;
+  asr?: { state: 'idle' | 'loading' | 'ready' | 'failed'; error: string };
+  tts?: { state: 'idle' | 'loading' | 'ready' | 'failed'; error: string };
 };
+
+export type SpeechStorageStatus = {
+  path: string;
+  files: number;
+  bytes: number;
+  queue: {
+    queued: number;
+    interactiveQueued: number;
+    backgroundQueued: number;
+    completed: number;
+    failed: number;
+  };
+};
+
+export type OpsMetrics = {
+  sampledAt: string;
+  app: { uptimeSeconds: number; goroutines: number; heapAllocBytes: number; heapSysBytes: number; heapObjects: number; rssBytes?: number; containerMemory?: { usageBytes?: number | null; limitBytes?: number | null } };
+  speechStorage: { path: string; files: number; bytes: number; error?: string };
+  databaseStorage?: { path: string; bytes: number };
+  tts: { queued: number; interactiveQueued: number; backgroundQueued: number; completed: number; failed: number; cancelled: number; promoted: number; lastDurationSeconds: number; lastError: string; active: null | { priority: number; started: boolean } };
+  ai?: {
+    process?: { rssBytes?: number; virtualBytes?: number; cpuPercent?: number; cpuSeconds?: number };
+    containerMemory?: { usageBytes?: number | null; limitBytes?: number | null };
+    models?: { tts?: { state?: string; error?: string }; pronunciation?: { state?: string; error?: string }; asrLoaded?: boolean; phonemeScorerLoaded?: boolean };
+    tasks?: Record<string, { running: number; requests: number; completed: number; failed: number; totalDurationSeconds: number; lastDurationSeconds: number }>;
+  };
+  aiError?: string;
+};
+
+export type OpsLogs = { app: string[]; ai: string[]; aiError?: string };
 
 // Operations that were saved locally and still need to reach the server.
 export type PendingOperation =

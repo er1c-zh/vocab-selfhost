@@ -3,11 +3,12 @@ torchaudio==2.8.0+cpu
 numpy==2.2.6
 kokoro==0.9.4
 # kokoro 0.9.4 predates huggingface_hub 1.x and transformers 5.x; those major
-# versions break model downloads (`open() got an unexpected keyword argument
-# 'metadata_errors'`) and the ALBERT loader kokoro relies on.
+# versions break model downloads and the ALBERT loader kokoro relies on.
 huggingface_hub<1.0
 transformers>=4.45,<5
 faster-whisper==1.2.1
+# faster-whisper 1.2.1 passes metadata_errors to av.open; PyAV 19 removed it.
+av>=11,<19
 openai-whisper==20250625
 scikit-learn==1.7.2
 joblib==1.5.3

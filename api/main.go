@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"embed"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -22,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,13 +28,32 @@ import (
 var staticFiles embed.FS
 
 type server struct {
-	store    *Store
-	dataDir  string
-	aiURL    string
-	aiClient *http.Client
+	store     *Store
+	dataDir   string
+	audioDir  string
+	aiURL     string
+	aiClient  *http.Client
+	apiLogs   *lineLogBuffer
+	startedAt time.Time
 	// azureSTTURL overrides the Azure Speech endpoint in tests; empty uses
 	// the standard regional host.
-	azureSTTURL string
+	azureSTTURL     string
+	ttsMu           sync.Mutex
+	audioCleanupMu  sync.Mutex
+	ttsInit         sync.Once
+	ttsCond         *sync.Cond
+	ttsQueue        []*ttsJob
+	ttsJobs         map[string]*ttsJob
+	ttsActive       *ttsJob
+	ttsClearing     bool
+	ttsSequence     uint64
+	ttsEnqueued     uint64
+	ttsCompleted    uint64
+	ttsFailed       uint64
+	ttsCancelled    uint64
+	ttsPromoted     uint64
+	ttsLastDuration time.Duration
+	ttsLastError    string
 }
 
 func main() {
@@ -48,9 +66,20 @@ func main() {
 		return
 	}
 
+	apiLogs := newLineLogBuffer(500)
+	log.SetOutput(io.MultiWriter(os.Stdout, apiLogs))
 	dataDir := envOr("APP_DATA_DIR", "./data")
-	if err := os.MkdirAll(filepath.Join(dataDir, "audio"), 0o750); err != nil {
+	audioDir := envOr("AUDIO_DIR", filepath.Join(dataDir, "audio"))
+	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		log.Fatal(err)
+	}
+	if err := os.MkdirAll(audioDir, 0o750); err != nil {
+		log.Fatal(err)
+	}
+	if copied, bytes, err := migrateLegacyAudio(filepath.Join(dataDir, "audio"), audioDir); err != nil {
+		log.Printf("speech storage migration failed: %v", err)
+	} else if copied > 0 {
+		log.Printf("speech storage migration copied=%d audio_bytes=%d", copied, bytes)
 	}
 	dbPath := filepath.Join(dataDir, "vocab.db")
 	dbURL := sqliteDSN(dbPath)
@@ -60,7 +89,8 @@ func main() {
 	}
 	defer store.Close()
 
-	s := &server{store: store, dataDir: dataDir, aiURL: strings.TrimRight(os.Getenv("AI_SERVICE_URL"), "/"), aiClient: &http.Client{Timeout: 6 * time.Minute}}
+	s := &server{store: store, dataDir: dataDir, audioDir: audioDir, aiURL: strings.TrimRight(os.Getenv("AI_SERVICE_URL"), "/"), aiClient: &http.Client{Timeout: 6 * time.Minute}, apiLogs: apiLogs, startedAt: time.Now()}
+	s.startTTSQueue()
 	addr := envOr("APP_ADDR", ":8080")
 	log.Printf("Vocab Self-host listening on %s", addr)
 	if err := http.ListenAndServe(addr, s); err != nil {
@@ -150,7 +180,13 @@ func (s *server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	case "tts":
 		s.handleTTS(w, r)
 	case "audio":
-		s.handleAudio(w, r, parts[1:])
+		if len(parts) == 1 {
+			s.handleAudioManagement(w, r)
+		} else {
+			s.handleAudio(w, r, parts[1:])
+		}
+	case "ops":
+		s.handleOps(w, r, parts[1:])
 	case "pronunciation":
 		if len(parts) == 2 && parts[1] == "model" {
 			s.handlePronunciationModel(w, r)
@@ -196,6 +232,7 @@ func (s *server) handleCards(w http.ResponseWriter, r *http.Request, parts []str
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
+			s.enqueueCardSpeech(card)
 			writeJSON(w, http.StatusCreated, card)
 		default:
 			methodNotAllowed(w)
@@ -262,6 +299,7 @@ func (s *server) handleCards(w http.ResponseWriter, r *http.Request, parts []str
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		s.enqueueCardSpeech(card)
 		writeJSON(w, http.StatusOK, card)
 	case http.MethodDelete:
 		err := s.store.deleteCard(r.Context(), id)
@@ -339,62 +377,45 @@ func (s *server) handleImportOrSync(w http.ResponseWriter, r *http.Request, kind
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	for _, card := range bundle.Cards {
+		s.enqueueCardSpeech(card)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "synced", "cards": len(bundle.Cards)})
 }
 
 func (s *server) handleTTS(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
 		return
 	}
-	var req struct {
-		Text  string `json:"text"`
-		Voice string `json:"voice"`
-	}
+	var req ttsRequest
 	if !decodeJSON(w, r, &req, 8<<10) {
 		return
 	}
-	req.Text = strings.TrimSpace(req.Text)
-	if req.Text == "" || len(req.Text) > 1000 {
-		writeError(w, http.StatusBadRequest, "text must contain 1-1000 characters")
+	if err := validateTTSRequest(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.Voice == "" {
-		req.Voice = "af_heart"
+	filename := speechFilename(req.Voice, req.Text)
+	fullPath := filepath.Join(s.audioStorageDir(), filename)
+	wasStored := false
+	if _, err := os.Stat(fullPath); err == nil {
+		wasStored = true
 	}
-	key := sha256.Sum256([]byte(req.Voice + "\x00" + req.Text))
-	filename := hex.EncodeToString(key[:]) + ".wav"
-	fullPath := filepath.Join(s.dataDir, "audio", filename)
-	if _, err := os.Stat(fullPath); err != nil {
-		response, status, err := s.callAI(r.Context(), "/v1/tts", req)
-		if err != nil {
-			writeError(w, status, err.Error())
-			return
-		}
-		var generated struct {
-			AudioBase64 string `json:"audioBase64"`
-		}
-		if err := json.Unmarshal(response, &generated); err != nil || generated.AudioBase64 == "" {
-			writeError(w, http.StatusBadGateway, "AI service returned no audio")
-			return
-		}
-		wav, err := base64.StdEncoding.DecodeString(generated.AudioBase64)
-		if err != nil || len(wav) < 44 || len(wav) > 24<<20 || string(wav[:4]) != "RIFF" {
-			writeError(w, http.StatusBadGateway, "AI service returned invalid WAV audio")
-			return
-		}
-		tmpPath := fullPath + ".tmp"
-		if err := os.WriteFile(tmpPath, wav, 0o640); err != nil {
-			writeError(w, http.StatusInternalServerError, "cannot cache generated audio")
-			return
-		}
-		if err := os.Rename(tmpPath, fullPath); err != nil {
-			os.Remove(tmpPath)
-			writeError(w, http.StatusInternalServerError, "cannot publish generated audio")
-			return
-		}
+	if err := s.enqueueSpeech(r.Context(), req.Text, req.Voice, ttsPriorityInteractive, true); err != nil {
+		log.Printf("TTS request priority=interactive duration=%.3fs result=error", time.Since(started).Seconds())
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"audioUrl": "/api/audio/" + filename, "cached": true})
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		log.Printf("TTS request priority=interactive duration=%.3fs result=missing", time.Since(started).Seconds())
+		writeError(w, http.StatusServiceUnavailable, "generated audio is not available")
+		return
+	}
+	log.Printf("TTS request priority=interactive duration=%.3fs audio_bytes=%d previously_stored=%t", time.Since(started).Seconds(), info.Size(), wasStored)
+	writeJSON(w, http.StatusOK, map[string]any{"audioUrl": "/api/audio/" + filename, "stored": true})
 }
 
 func (s *server) handleAudio(w http.ResponseWriter, r *http.Request, parts []string) {
@@ -407,8 +428,17 @@ func (s *server) handleAudio(w http.ResponseWriter, r *http.Request, parts []str
 		http.NotFound(w, r)
 		return
 	}
+	started := time.Now()
+	fullPath := filepath.Join(s.audioStorageDir(), name)
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		log.Printf("TTS audio delivery result=not_found duration=%.3fs", time.Since(started).Seconds())
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "audio/wav")
-	http.ServeFile(w, r, filepath.Join(s.dataDir, "audio", name))
+	http.ServeFile(w, r, fullPath)
+	log.Printf("Speech audio delivery duration=%.3fs audio_bytes=%d", time.Since(started).Seconds(), info.Size())
 }
 
 func (s *server) proxyAI(w http.ResponseWriter, r *http.Request, endpoint string) {

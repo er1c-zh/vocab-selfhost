@@ -211,6 +211,7 @@ func (s *server) processBatch(r *http.Request, req BatchRequest) BatchResponse {
 			response.Results = append(response.Results, result)
 			continue
 		}
+		s.enqueueCardSpeech(card)
 		result.Status = "created"
 		result.CardID = card.ID
 		result.Word = card.Word
