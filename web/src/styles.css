@@ -120,12 +120,19 @@ h1, h2, h3, p { margin-top: 0; }
 .pron-result b, .pron-result small { display: block; }
 .pron-result b { color: #506a58; font-size: 10px; }
 .pron-result small { margin-top: 4px; color: #818b83; font-size: 9px; }
-.pron-result > span { color: #47745b; font-family: Manrope, sans-serif; font-size: 16px; font-weight: 700; }
+.pronunciation-part, .asr-part { grid-column: 1 / -1; min-width: 0; }
+.pronunciation-part-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+.pronunciation-part-heading > div { min-width: 0; }
+.pronunciation-part-heading > span { color: #47745b; font-family: Manrope, sans-serif; font-size: 16px; font-weight: 700; }
+.pron-result .asr-part { padding-top: 9px; border-top: 1px solid #e6ece5; }
+.pron-result .asr-part p { margin-bottom: 0; }
+.pron-result .pronunciation-part small, .pron-result .asr-part small { line-height: 1.5; overflow-wrap: anywhere; }
+.pron-result .pronunciation-part small.is-error, .pron-result .asr-part small.is-error { color: #a65e50; }
 .pron-result p { grid-column: 1 / -1; margin: 3px 0 0; color: #969e97; font-size: 8px; line-height: 1.5; }
 .pron-result.needs_practice { background: #fff9f4; border-color: #f1dfcd; }
-.pron-result.needs_practice > span { color: #b17450; }
+.pron-result.needs_practice .pronunciation-part-heading > span { color: #b17450; }
 .pron-result.inconclusive { background: #f7f7f5; }
-.pron-result.inconclusive > span { color: #89938b; }
+.pron-result.inconclusive .pronunciation-part-heading > span { color: #89938b; }
 .empty-review { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 375px; padding: 40px 20px; border: 1px dashed #dce2db; border-radius: 18px; background: #fafbf8; text-align: center; }
 .empty-orbit { display: grid; place-items: center; width: 65px; height: 65px; margin-bottom: 21px; border: 1px solid #d8e6d8; border-radius: 50%; background: #eff6ee; color: #50795b; font-size: 25px; }
 .empty-review h2 { margin: 10px 0 8px; color: #31443a; font-family: Manrope, sans-serif; font-size: 21px; letter-spacing: -.6px; }

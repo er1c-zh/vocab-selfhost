@@ -77,8 +77,8 @@ func (s *server) handlePronunciation(w http.ResponseWriter, r *http.Request) {
 
 	cfg := s.loadPronunciation(r.Context())
 	if cfg == nil || cfg.Provider != "azure" {
-		// Local path: the self-hosted AI service scores target phones and returns
-		// ASR transcript matching only when local phoneme scoring is unavailable.
+		// Local path returns only phoneme scores; ASR transcription has a separate
+		// endpoint so the browser can display either result as soon as it arrives.
 		response, status, err := s.callAIBytes(r.Context(), "/v1/pronunciation", raw)
 		if err != nil {
 			writeError(w, status, err.Error())
@@ -102,7 +102,10 @@ func (s *server) handlePronunciation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(audio) < 800 {
-		writeJSON(w, http.StatusOK, azureInconclusive(req.Expected))
+		result := azureInconclusive(req.Expected)
+		delete(result, "transcript")
+		delete(result, "confidence")
+		writeJSON(w, http.StatusOK, result)
 		return
 	}
 	if len(audio) > 12<<20 {
@@ -118,7 +121,43 @@ func (s *server) handlePronunciation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	delete(result, "transcript")
+	delete(result, "confidence")
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *server) handleASR(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 16<<20))
+	if err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, "request is too large")
+		return
+	}
+	var req PronunciationRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	req.Expected = strings.TrimSpace(req.Expected)
+	if req.Expected == "" || len(req.Expected) > 100 {
+		writeError(w, http.StatusBadRequest, "expected word must contain 1-100 characters")
+		return
+	}
+	started := time.Now()
+	defer func() {
+		log.Printf("ASR transcription duration=%s", time.Since(started).Round(time.Millisecond))
+	}()
+	response, status, err := s.callAIBytes(r.Context(), "/v1/asr", raw)
+	if err != nil {
+		writeError(w, status, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(response)
 }
 
 func azureContentType(mime string) (string, error) {

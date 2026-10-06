@@ -446,6 +446,115 @@ def local_phoneme_result(expected: str, transcript: str, confidence: float, asse
     }
 
 
+def _decode_assessment_audio(expected: str, audio_b64: str) -> bytes:
+    if not expected.strip() or len(expected) > 100:
+        raise ValueError("expected word must contain 1-100 characters")
+    try:
+        audio = base64.b64decode(audio_b64, validate=True)
+    except Exception as exc:
+        raise ValueError("audioBase64 is not valid base64") from exc
+    if len(audio) > 12 * 1024 * 1024:
+        raise ValueError("recording is too large; keep it under 12 MB")
+    return audio
+
+
+def _audio_suffix(mime: str) -> str:
+    if "wav" in mime:
+        return ".wav"
+    if "mp4" in mime or "m4a" in mime:
+        return ".m4a"
+    if "ogg" in mime:
+        return ".ogg"
+    return ".webm"
+
+
+def transcribe_audio(expected: str, audio_b64: str, mime: str) -> dict[str, Any]:
+    """Run only faster-whisper and return its transcript comparison result."""
+    audio = _decode_assessment_audio(expected, audio_b64)
+    if len(audio) < 800:
+        return pronunciation_result(expected, "", 0.0)
+
+    started = time.perf_counter()
+    timings: dict[str, float] = {}
+    transcript = ""
+    confidence = 0.0
+    asr_started = time.perf_counter()
+    inference_started: float | None = None
+    try:
+        model_started = time.perf_counter()
+        model = _load_asr()
+        timings["asr_load_s"] = time.perf_counter() - model_started
+        with tempfile.NamedTemporaryFile(suffix=_audio_suffix(mime)) as temp:
+            temp.write(audio)
+            temp.flush()
+            inference_started = time.perf_counter()
+            with _asr_inference_lock:
+                # VAD can reject these short practice clips as too brief.
+                segments, info = model.transcribe(
+                    temp.name,
+                    language="en",
+                    beam_size=3,
+                    vad_filter=False,
+                    condition_on_previous_text=False,
+                )
+                results = list(segments)
+            timings["asr_inference_s"] = time.perf_counter() - inference_started
+        transcript = " ".join(segment.text.strip() for segment in results).strip()
+        if results:
+            total = sum(max(segment.end - segment.start, 0.01) for segment in results)
+            avg_logprob = sum(segment.avg_logprob * max(segment.end - segment.start, 0.01) for segment in results) / total
+            confidence = math.exp(min(0.0, avg_logprob)) * float(getattr(info, "language_probability", 1.0))
+    except Exception as exc:
+        timings.setdefault("asr_load_s", time.perf_counter() - asr_started)
+        timings.setdefault("asr_inference_s", time.perf_counter() - inference_started if inference_started is not None else 0.0)
+        print(f"Local ASR transcription unavailable: {type(exc).__name__}: {exc}")
+        raise
+
+    timings["total_s"] = time.perf_counter() - started
+    details = " ".join(f"{name}={elapsed:.2f}s" for name, elapsed in timings.items())
+    print(f"ASR timing: {details}")
+    return pronunciation_result(expected, transcript, confidence)
+
+
+def score_pronunciation_audio(expected: str, audio_b64: str) -> dict[str, Any]:
+    """Run only local phoneme scoring; ASR runs through its own endpoint."""
+    audio = _decode_assessment_audio(expected, audio_b64)
+    if len(audio) < 800:
+        return {
+            "expected": expected,
+            "similarity": 0.0,
+            "status": "inconclusive",
+            "method": "local-phoneme-assessment",
+            "notice": "录音过短，无法完成音素评分；请对着麦克风清楚地读一次。",
+        }
+
+    started = time.perf_counter()
+    timings: dict[str, float] = {}
+    from pronunciation_model import score_expected_phones
+
+    decode_started = time.perf_counter()
+    audio_16k = _decode_audio_16k_mono(audio)
+    timings["audio_decode_s"] = time.perf_counter() - decode_started
+    model_started = time.perf_counter()
+    scorer = _load_phoneme_scorer()
+    timings["phoneme_model_load_s"] = time.perf_counter() - model_started
+    score_started = time.perf_counter()
+    try:
+        with _phoneme_inference_lock:
+            assessment = score_expected_phones(expected, audio_16k, scorer)
+    finally:
+        timings["phoneme_score_s"] = time.perf_counter() - score_started
+    timings["total_s"] = time.perf_counter() - started
+    details = " ".join(f"{name}={elapsed:.2f}s" for name, elapsed in timings.items())
+    print(f"Pronunciation timing: {details} candidates={int(assessment.get('candidate_count', 0))}")
+    result = local_phoneme_result(expected, "", 0.0, assessment)
+    result.pop("transcript", None)
+    result.pop("confidence", None)
+    return result
+
+
+# Backward-compatible combined helper for Python callers. The HTTP handlers use
+# transcribe_audio() and score_pronunciation_audio() independently.
 def assess_audio(expected: str, audio_b64: str, mime: str) -> dict[str, Any]:
     if not expected.strip() or len(expected) > 100:
         raise ValueError("expected word must contain 1-100 characters")
@@ -511,8 +620,7 @@ def assess_audio(expected: str, audio_b64: str, mime: str) -> dict[str, Any]:
             timings.setdefault("asr_inference_s", time.perf_counter() - asr_inference_started)
         else:
             timings.setdefault("asr_inference_s", 0.0)
-        # The expected text is enough for phone-level scoring; ASR is only used
-        # to display a transcript and should not block the local scorer.
+        # Preserve phone-level scoring for legacy callers even when ASR fails.
         asr_error = exc
         print(f"Local ASR transcription unavailable: {type(exc).__name__}: {exc}")
     result = pronunciation_result(expected, transcript, model_confidence)
@@ -634,7 +742,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         endpoint = urlsplit(self.path).path
-        task_name = {"/v1/tts": "tts", "/v1/pronunciation": "pronunciation", "/v1/gloss": "gloss", "/v1/pronunciation/model": "pronunciation-model"}.get(endpoint)
+        task_name = {"/v1/tts": "tts", "/v1/asr": "asr", "/v1/pronunciation": "pronunciation", "/v1/gloss": "gloss", "/v1/pronunciation/model": "pronunciation-model"}.get(endpoint)
         started = time.perf_counter()
         if task_name:
             _task_started(task_name)
@@ -645,8 +753,12 @@ class Handler(BaseHTTPRequestHandler):
                 audio = synthesize(str(payload.get("text", "")), str(payload.get("voice", "af_heart")))
                 self._json(200, {"audioBase64": base64.b64encode(audio).decode("ascii"), "format": "wav", "sampleRate": 24000, "provider": "kokoro"})
                 succeeded = True
+            elif endpoint == "/v1/asr":
+                result = transcribe_audio(str(payload.get("expected", "")), str(payload.get("audioBase64", "")), str(payload.get("audioMime", "")))
+                self._json(200, result)
+                succeeded = True
             elif endpoint == "/v1/pronunciation":
-                result = assess_audio(str(payload.get("expected", "")), str(payload.get("audioBase64", "")), str(payload.get("audioMime", "")))
+                result = score_pronunciation_audio(str(payload.get("expected", "")), str(payload.get("audioBase64", "")))
                 self._json(200, result)
                 succeeded = True
             elif endpoint == "/v1/pronunciation/model":
@@ -707,4 +819,3 @@ if __name__ == "__main__":
     threading.Thread(target=_preload_models_on_startup, name="speech-model-preload", daemon=True).start()
     print(f"Vocab AI service listening on {address}:{port}")
     http_server.serve_forever()
-

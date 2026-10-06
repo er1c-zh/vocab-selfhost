@@ -8,7 +8,16 @@ import type { SyncController, SyncStatus } from './sync';
 import BatchCollectView from './BatchCollect';
 
 type View = 'review' | 'library' | 'browse' | 'add' | 'collect' | 'monitor' | 'settings';
-type PronunciationResult = {
+type PronunciationScore = {
+  expected: string;
+  similarity: number;
+  status: string;
+  method: string;
+  notice: string;
+  scores?: { overall?: number; accuracy: number; fluency?: number; prosody?: number; completeness?: number };
+  words?: { word: string; accuracy: number; phonemes?: { phoneme: string; accuracy: number }[] }[];
+};
+type ASRResult = {
   expected: string;
   transcript: string;
   similarity: number;
@@ -16,9 +25,18 @@ type PronunciationResult = {
   status: string;
   method: string;
   notice: string;
-  scores?: { overall?: number; accuracy: number; fluency?: number; prosody?: number; completeness?: number };
-  words?: { word: string; accuracy: number; phonemes?: { phoneme: string; accuracy: number }[] }[];
 };
+type AssessmentPart<T> = { state: 'idle' | 'loading' | 'ready' | 'failed'; result?: T; error?: string };
+type AssessmentState = {
+  submitted: boolean;
+  pronunciation: AssessmentPart<PronunciationScore>;
+  asr: AssessmentPart<ASRResult>;
+};
+const emptyAssessment = (): AssessmentState => ({
+  submitted: false,
+  pronunciation: { state: 'idle' },
+  asr: { state: 'idle' },
+});
 
 type RecordingSession = {
   cardId: string;
@@ -314,7 +332,7 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
   const [cancelingRecording, setCancelingRecording] = useState(false);
   const [checking, setChecking] = useState(false);
   const [ratingSaving, setRatingSaving] = useState(false);
-  const [result, setResult] = useState<PronunciationResult | null>(null);
+  const [assessment, setAssessment] = useState<AssessmentState>(emptyAssessment);
   const [played, setPlayed] = useState(false);
   const [speechState, setSpeechState] = useState<'idle' | 'loading' | 'playing'>('idle');
   const recordingSessionRef = useRef<RecordingSession | null>(null);
@@ -341,7 +359,7 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
     }
     setCancelingRecording(false);
     setRevealed(false);
-    setResult(null);
+    setAssessment(emptyAssessment());
     setPlayed(false);
   }, [current?.id]);
   useEffect(() => {
@@ -416,6 +434,7 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
       notify('当前浏览器不支持录音；iPhone 请使用 HTTPS 或本机地址打开');
       return;
     }
+    setAssessment(emptyAssessment());
     const session: RecordingSession = {
       cardId: current.id,
       expected: current.word,
@@ -450,7 +469,7 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
         setStartingRecording(false);
         setRecording(false);
         setChecking(false);
-        setResult(null);
+        setAssessment(emptyAssessment());
         notify('录音失败，请检查麦克风权限后重试');
       };
       recorder.onstop = async () => {
@@ -473,13 +492,38 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
             reader.readAsDataURL(normalized);
           });
           if (session.cancelled) return;
-          const assessed = await api<PronunciationResult>('/pronunciation', { method: 'POST', body: JSON.stringify({ expected: session.expected, audioMime: normalized.type, audioBase64 }) });
-          if (!session.cancelled) {
-            setResult(assessed);
-          }
+          const body = JSON.stringify({ expected: session.expected, audioMime: normalized.type, audioBase64 });
+          if (session.cancelled) return;
+          setAssessment({
+            submitted: true,
+            pronunciation: { state: 'loading' },
+            asr: { state: 'loading' },
+          });
+          const requestPronunciation = async () => {
+            try {
+              const result = await api<PronunciationScore>('/pronunciation', { method: 'POST', body }, 7 * 60 * 1000);
+              if (!session.cancelled) setAssessment((state) => ({ ...state, pronunciation: { state: 'ready', result } }));
+              return true;
+            } catch (error) {
+              if (!session.cancelled) setAssessment((state) => ({ ...state, pronunciation: { state: 'failed', error: (error as Error).message || '发音评分失败' } }));
+              return false;
+            }
+          };
+          const requestASR = async () => {
+            try {
+              const result = await api<ASRResult>('/asr', { method: 'POST', body }, 7 * 60 * 1000);
+              if (!session.cancelled) setAssessment((state) => ({ ...state, asr: { state: 'ready', result } }));
+              return true;
+            } catch (error) {
+              if (!session.cancelled) setAssessment((state) => ({ ...state, asr: { state: 'failed', error: (error as Error).message || 'ASR 识别失败' } }));
+              return false;
+            }
+          };
+          const [pronunciationReady, asrReady] = await Promise.all([requestPronunciation(), requestASR()]);
+          if (!session.cancelled && !pronunciationReady && !asrReady) notify('发音评分和 ASR 识别都未能完成，请查看结果提示后重试');
         } catch (error) {
           if (!session.cancelled) {
-            setResult(null);
+            setAssessment(emptyAssessment());
             notify((error as Error).message || '读音评估失败，请检查 AI 模型和录音');
           }
         } finally {
@@ -541,13 +585,13 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
         <>
           <div className="reveal-area">
             <div className="review-action-row">
-              <button className="button button-primary reveal-button" onClick={() => setRevealed(true)} disabled={startingRecording || recording || checking}>查看释义</button>
+              <button className="button button-primary reveal-button" onClick={() => setRevealed(true)} disabled={startingRecording || recording}>查看释义</button>
               <div className="review-action-slot">{speechButton}<span>朗读</span></div>
-              {!result && <HoldToRecordButton className="mic-link" starting={startingRecording} recording={recording} checking={checking} canceling={cancelingRecording} onStart={startRecording} onStop={stopRecording} onCancel={cancelCurrentRecording} onCancelingChange={setCancelingRecording} idleLabel="按住录音" />}
+              {!assessment.submitted && <HoldToRecordButton className="mic-link" starting={startingRecording} recording={recording} checking={checking} canceling={cancelingRecording} onStart={startRecording} onStop={stopRecording} onCancel={cancelCurrentRecording} onCancelingChange={setCancelingRecording} idleLabel="按住录音" />}
             </div>
             <span className="review-actions-hint">松开提交评估 · 向上滑动取消</span>
           </div>
-          {result && <PronunciationFeedback result={result} onRetry={startRecording} onStop={stopRecording} onCancel={cancelCurrentRecording} onCancelingChange={setCancelingRecording} starting={startingRecording} recording={recording} checking={checking} canceling={cancelingRecording} />}
+          {assessment.submitted && <PronunciationFeedback assessment={assessment} onRetry={startRecording} onStop={stopRecording} onCancel={cancelCurrentRecording} onCancelingChange={setCancelingRecording} starting={startingRecording} recording={recording} checking={checking} canceling={cancelingRecording} />}
         </>
       ) : (
         <div className="answer-face">
@@ -556,8 +600,8 @@ function ReviewView({ cards, allCount, totalToday, onRate, onAdd, notify }: { ca
           {current.contextMeaning && <p className="context-meaning">{current.contextMeaning}</p>}
           {current.contextText && <blockquote>{current.contextText}</blockquote>}
           {current.source && <span className="source-line">来源 · {current.source}</span>}
-          {result
-            ? <PronunciationFeedback result={result} onRetry={startRecording} onStop={stopRecording} onCancel={cancelCurrentRecording} onCancelingChange={setCancelingRecording} starting={startingRecording} recording={recording} checking={checking} canceling={cancelingRecording} />
+          {assessment.submitted
+            ? <PronunciationFeedback assessment={assessment} onRetry={startRecording} onStop={stopRecording} onCancel={cancelCurrentRecording} onCancelingChange={setCancelingRecording} starting={startingRecording} recording={recording} checking={checking} canceling={cancelingRecording} />
             : <HoldToRecordButton className="pron-retry" starting={startingRecording} recording={recording} checking={checking} canceling={cancelingRecording} onStart={startRecording} onStop={stopRecording} onCancel={cancelCurrentRecording} onCancelingChange={setCancelingRecording} idleLabel="按住说出单词，松开提交评估" />}
           <div className="rating-prompt">你这次回想得怎么样？</div>
           <div className="rating-row">
@@ -647,47 +691,49 @@ function HoldToRecordButton({ className, starting, recording, checking, cancelin
   </div>;
 }
 
-function PronunciationFeedback({ result, onRetry, onStop, onCancel, onCancelingChange, starting, recording, checking, canceling }: { result: PronunciationResult; onRetry: () => void; onStop: () => void; onCancel: () => void; onCancelingChange: (canceling: boolean) => void; starting: boolean; recording: boolean; checking: boolean; canceling: boolean }) {
-  const localPhoneme = result.method === 'local-phoneme-assessment';
-  const scored = localPhoneme || result.method === 'azure-pronunciation-assessment';
-  const title = result.status === 'recognized'
-    ? (scored ? '本次发音分数较高' : '识别到了目标词')
-    : result.status === 'needs_practice'
-      ? (scored ? '这个词的发音还可以练习' : '识别结果与目标不同')
-      : '这次结果不确定';
+function PronunciationFeedback({ assessment, onRetry, onStop, onCancel, onCancelingChange, starting, recording, checking, canceling }: { assessment: AssessmentState; onRetry: () => void; onStop: () => void; onCancel: () => void; onCancelingChange: (canceling: boolean) => void; starting: boolean; recording: boolean; checking: boolean; canceling: boolean }) {
+  const pronunciation = assessment.pronunciation.result;
+  const asr = assessment.asr.result;
+  const pronunciationTitle = pronunciation?.status === 'recognized'
+    ? '本次发音分数较高'
+    : pronunciation?.status === 'needs_practice'
+      ? '这个词的发音还可以练习'
+      : pronunciation ? '这次发音结果不确定' : '';
+  const asrSummary = asr
+    ? `听到“${asr.transcript || '暂未获得转写'}” · 识别置信度 ${Math.round(asr.confidence * 100)}%`
+    : '';
 
-  return <div className={`pron-result ${result.status}`}>
-    <div>
-      <b>{title}</b>
-      <small>
-        {localPhoneme
-          ? result.transcript
-            ? <>听到“{result.transcript}” · 本地音素评分 {Math.round(result.similarity * 100)} 分 · ASR 识别信心 {Math.round(result.confidence * 100)}%</>
-            : <>ASR 暂未获得转写 · 本地音素评分 {Math.round(result.similarity * 100)} 分</>
-          : result.method === 'azure-pronunciation-assessment'
-            ? result.transcript
-              ? <>听到“{result.transcript}” · 发音准确度 {Math.round(result.similarity * 100)}% · 识别信心 {Math.round(result.confidence * 100)}%</>
-              : <>ASR 暂未获得转写 · 发音准确度 {Math.round(result.similarity * 100)}%</>
-            : <>听到“{result.transcript || '暂未获得转写'}” · 识别置信度 {Math.round(result.confidence * 100)}%</>}
-      </small>
-    </div>
-    <span>{Math.round(result.similarity * 100)}%</span>
-    {result.scores && <div className="pron-score-row">
-      {result.scores.overall !== undefined && <i>综合 {Math.round(result.scores.overall)}</i>}
-      <i>准确度 {Math.round(result.scores.accuracy)}</i>
-      {result.scores.fluency !== undefined && <i>流利度 {Math.round(result.scores.fluency)}</i>}
-      {result.scores.prosody !== undefined && <i>韵律 {Math.round(result.scores.prosody)}</i>}
-      {result.scores.completeness !== undefined && <i>完整度 {Math.round(result.scores.completeness)}</i>}
-    </div>}
-    {result.words && result.words.length > 0 && <div className="pron-words">
-      {result.words.map((word, index) => <div className="pron-word" key={`${word.word}-${index}`}>
-        <i className={word.accuracy >= 80 ? 'good' : word.accuracy >= 60 ? 'mid' : 'low'}>{word.word} {Math.round(word.accuracy)}</i>
-        {word.phonemes && word.phonemes.length > 0 && <div className="pron-phonemes">
-          {word.phonemes.map((phoneme, phonemeIndex) => <i className={phoneme.accuracy >= 80 ? 'good' : phoneme.accuracy >= 60 ? 'mid' : 'low'} key={`${phoneme.phoneme}-${phonemeIndex}`}>{phoneme.phoneme} {Math.round(phoneme.accuracy)}</i>)}
-        </div>}
-      </div>)}
-    </div>}
-    <p>{result.notice}</p>
+  return <div className={`pron-result${pronunciation ? ` ${pronunciation.status}` : ''}`} aria-live="polite">
+    <section className="pronunciation-part">
+      <div className="pronunciation-part-heading">
+        <div>
+          <b>发音评分</b>
+          <small className={assessment.pronunciation.state === 'failed' ? 'is-error' : ''}>{pronunciation ? pronunciationTitle : assessment.pronunciation.state === 'loading' ? '正在检测发音…' : assessment.pronunciation.error || '等待发音评分'}</small>
+        </div>
+        {pronunciation && <span>{Math.round(pronunciation.similarity * 100)}%</span>}
+      </div>
+      {pronunciation?.scores && <div className="pron-score-row">
+        {pronunciation.scores.overall !== undefined && <i>综合 {Math.round(pronunciation.scores.overall)}</i>}
+        <i>准确度 {Math.round(pronunciation.scores.accuracy)}</i>
+        {pronunciation.scores.fluency !== undefined && <i>流利度 {Math.round(pronunciation.scores.fluency)}</i>}
+        {pronunciation.scores.prosody !== undefined && <i>韵律 {Math.round(pronunciation.scores.prosody)}</i>}
+        {pronunciation.scores.completeness !== undefined && <i>完整度 {Math.round(pronunciation.scores.completeness)}</i>}
+      </div>}
+      {pronunciation?.words && pronunciation.words.length > 0 && <div className="pron-words">
+        {pronunciation.words.map((word, index) => <div className="pron-word" key={`${word.word}-${index}`}>
+          <i className={word.accuracy >= 80 ? 'good' : word.accuracy >= 60 ? 'mid' : 'low'}>{word.word} {Math.round(word.accuracy)}</i>
+          {word.phonemes && word.phonemes.length > 0 && <div className="pron-phonemes">
+            {word.phonemes.map((phoneme, phonemeIndex) => <i className={phoneme.accuracy >= 80 ? 'good' : phoneme.accuracy >= 60 ? 'mid' : 'low'} key={`${phoneme.phoneme}-${phonemeIndex}`}>{phoneme.phoneme} {Math.round(phoneme.accuracy)}</i>)}
+          </div>}
+        </div>)}
+      </div>}
+      {pronunciation?.notice && <p>{pronunciation.notice}</p>}
+    </section>
+    <section className="asr-part">
+      <b>ASR 识别</b>
+      <small className={assessment.asr.state === 'failed' ? 'is-error' : ''}>{asr ? asrSummary : assessment.asr.state === 'loading' ? '正在识别语音…' : assessment.asr.error || '等待 ASR 识别'}</small>
+      {asr?.notice && <p>{asr.notice}</p>}
+    </section>
     <HoldToRecordButton className="pron-retry" starting={starting} recording={recording} checking={checking} canceling={canceling} onStart={onRetry} onStop={onStop} onCancel={onCancel} onCancelingChange={onCancelingChange} idleLabel="按住重新录音，松开提交评估" />
   </div>;
 }
@@ -1190,4 +1236,3 @@ function AiTextSettingsCard({ notify }: { notify: (message: string) => void }) {
     </>}
   </article>;
 }
-

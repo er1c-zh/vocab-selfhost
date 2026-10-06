@@ -195,6 +195,12 @@ func (s *server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		} else {
 			writeError(w, http.StatusNotFound, "not found")
 		}
+	case "asr":
+		if len(parts) == 1 {
+			s.handleASR(w, r)
+		} else {
+			writeError(w, http.StatusNotFound, "not found")
+		}
 	case "gloss":
 		s.proxyAI(w, r, "/v1/gloss")
 	case "settings":

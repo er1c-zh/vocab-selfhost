@@ -20,7 +20,7 @@
 
 - 本项目不搜索 PDF、不提供 PDF 阅读器。使用时在论文/PDF 阅读器里复制段落，再粘贴到“收集新词”页面。
 - 仓库只附 10 条英语词典示例，不包含大型词典数据库。可以从“设置与数据”导入自己的 JSON 或 TSV 词典；TSV 每行依次为 `word<TAB>ipa<TAB>definition<TAB>locale`。没有本地词条时 IPA 不会被猜造，需要手动填写或导入词典。
-- 默认本地模式用 Whisper Phoneme CTC 对齐目标词的音素并估算音素/单词分数，使用 faster-whisper 展示识别文本；Kokoro、ASR 和音素评分模型会在 AI 容器启动后依次预加载并常驻内存。模型不可用或词典没有目标词时回退到转写比较。可选 Azure 模式会给出准确度、流利度、完整度、韵律及服务响应中的音素分数。两种自动评分都只用于练习反馈，不是口音诊断或母语水平认证。
+- 默认本地模式将 Whisper Phoneme CTC 发音评分与 faster-whisper 转写分开并行请求，页面按先到先展示；某项模型不可用时，另一项仍会返回结果。Kokoro、ASR 和音素评分模型会在 AI 容器启动后依次预加载并常驻内存。可选 Azure 模式会给出准确度、流利度、完整度、韵律及服务响应中的音素分数。两种自动评分都只用于练习反馈，不是口音诊断或母语水平认证。
 - PWA 的离线功能依赖设备浏览器缓存；服务器是跨设备数据源。首次登录和同步需联网。浏览器清理站点数据前请先导出备份。
 - 语音模型权重默认缓存在 Compose 的 `ai-models` volume；可用 `AI_MODEL_STORAGE_PATH` 改为宿主机或 NAS 的绝对路径，避免镜像更新或重建时重新下载。AI 服务首次启动需要访问 Hugging Face。设置页显示 ASR、音素模型和 Kokoro 的加载状态，也可手动重试准备音素模型。Whisper Phoneme CTC 模型仓库约 96 MB；模型仓库提供者报告其在 SpeechOcean762 音素测试上的相关系数为 0.606，需要用实际设备录音继续验证。多音词会试算 CMU 词典读音并采用评分较高者。
 
@@ -117,13 +117,13 @@ AI_TEXT_API_KEY=
 
 打开「设置与数据 → 发音评估」，选择 Azure，填写 Speech 资源所在区域（例如 `eastasia`）和订阅 Key，然后保存。Key 存在服务器 SQLite 设置中，接口只返回是否已配置和掩码提示，不会发给浏览器，也不会进入 JSON 备份。录音经 Go API 发给 Azure Speech 处理，费用和音频数据处理遵循 Azure 账户与服务条款；未选择 Azure 时使用下方的本地音素评测。
 
-发音按钮录制短音频后会在浏览器转换为 16 kHz 单声道 PCM WAV。Azure 模式按 `en-US` 目标词做 scripted pronunciation assessment；评估结果含识别文本、置信度和评分，具体音素明细以服务响应为准。
+发音按钮录制短音频后会在浏览器转换为 16 kHz 单声道 PCM WAV。Azure 模式用 `en-US` 目标词做 scripted pronunciation assessment，页面将 Azure 评分和本地 faster-whisper 转写分别显示；具体音素明细以服务响应为准。
 
 ## 本地音素评测
 
-默认本地模式除了 faster-whisper 转写外，还使用固定版本的 [Whisper Phoneme CTC](https://huggingface.co/vb223/whisper-base-en-phoneme-ctc)，将录音对齐到 CMU 发音词典中的目标音素，显示模型估算的单词和音素分数。无需 Azure Key，也无需 GPU。AI 容器启动后会依次下载/加载 Kokoro、faster-whisper 和音素评分模型，成功加载的模型在进程运行期间常驻内存。设置页会分别显示三者加载状态，也保留了手动准备音素模型的入口；约 96 MB 的音素模型文件保存在 `/models` 持久化挂载中。模型代码按 MIT 授权随 AI 服务构建，模型权重和回归器按固定 revision 下载，不从模型仓库执行 Python 源码。
+默认本地模式将 faster-whisper 转写和 Whisper Phoneme CTC 发音评分作为两个独立请求并行处理。页面会在任一请求有结果时先展示该项，另一项继续显示加载状态。音素模型或发音词典不可用时，ASR 文本比较仍可单独展示。评分模型使用固定版本的 [Whisper Phoneme CTC](https://huggingface.co/vb223/whisper-base-en-phoneme-ctc)，将录音对齐到 CMU 发音词典中的目标音素，显示模型估算的单词和音素分数。无需 Azure Key，也无需 GPU。AI 容器启动后会依次下载/加载 Kokoro、faster-whisper 和音素评分模型，成功加载的模型在进程运行期间常驻内存。设置页会分别显示三者加载状态，也保留了手动准备音素模型的入口；约 96 MB 的音素模型文件保存在 `/models` 持久化挂载中。模型代码按 MIT 授权随 AI 服务构建，模型权重和回归器按固定 revision 下载，不从模型仓库执行 Python 源码。
 
-练习时按住发音按钮开始采集，说完松开按钮结束并提交评估；手机页面会显示录音浮层，向上滑动可取消当前录音，取消时不会发送评测请求。评测结果不会自动显示释义。键盘用户可按住空格或回车录音。麦克风流在应用页面存活期间复用，松开或取消后禁用音轨，切换复习卡/页面不需要再次调用麦克风；关闭或刷新页面时由浏览器回收流。浏览器是否记住跨页面/重启的权限仍由浏览器和系统权限设置决定。单词录音关闭 VAD 语音端点过滤，避免短词被误判为静音；如果音素模型有评分但 ASR 没有转写，界面会分别说明，不会把空转写写成“未识别到语音”。
+练习时按住发音按钮开始采集，说完松开按钮结束并同时提交发音评分和 ASR 转写；页面按各自完成时间异步展示两项结果，某项失败时另一项仍可用。手机页面会显示录音浮层，向上滑动可取消当前录音，取消时不会发送评测请求。评测结果不会自动显示释义。键盘用户可按住空格或回车录音。麦克风流在应用页面存活期间复用，松开或取消后禁用音轨，切换复习卡/页面不需要再次调用麦克风；关闭或刷新页面时由浏览器回收流。浏览器是否记住跨页面/重启的权限仍由浏览器和系统权限设置决定。单词录音关闭 VAD 语音端点过滤，避免短词被误判为静音；ASR 没有转写时，界面会保留空转写状态说明。
 
 如果一次评估仍耗时较长，可实时查看分阶段耗时。在部署目录运行下面的命令，然后在页面评估一个词；停止查看时按 `Ctrl+C`。日志不包含录音或转写内容：
 
@@ -131,13 +131,13 @@ AI_TEXT_API_KEY=
 docker compose logs -f --since=15m --tail=100 ai app
 ```
 
-AI 会输出以 `Pronunciation timing:` 开头的阶段日志：`asr_load_s` 和 `phoneme_model_load_s` 是模型准备时间；`asr_inference_s` 和 `phoneme_score_s` 是计算时间；`total_s` 是 AI 端总耗时；`candidates` 是比较的词典读音数量。Go API 同时输出 `Pronunciation assessment provider=... duration=...`，表示实际走本地还是 Azure，以及 API 请求总时长。本地长驻的 AI 进程会复用已加载的模型；模型准备字段只有首次加载或进程重启后的首个请求应明显偏高。
+AI 会分别输出以 `ASR timing:` 和 `Pronunciation timing:` 开头的阶段日志。ASR 的 `asr_load_s`、`asr_inference_s` 和 `total_s` 分别表示模型准备、推理和总耗时；发音评分的 `audio_decode_s`、`phoneme_model_load_s`、`phoneme_score_s` 和 `total_s` 表示对应阶段耗时，`candidates` 是比较的词典读音数量。Go API 分别输出 `ASR transcription duration=...` 和 `Pronunciation assessment provider=... duration=...`。本地长驻的 AI 进程会复用已加载的模型；模型准备字段只有首次加载或进程重启后的首个请求应明显偏高。
 
 AI 容器启动后会在后台依次下载并加载 Kokoro、faster-whisper 和 Whisper Phoneme CTC，逐项输出 `Startup model preload ready` 或失败日志；健康检查在预加载期间仍可响应。成功加载的模型在 AI 进程存活期间常驻内存，容器重启后从 `/models` 持久化挂载读取。`/healthz` 与设置页提供 TTS、ASR、音素模型各自的状态。Go API 使用单 worker 的 TTS 优先队列：新词、批量收词和导入卡片进入后台队列；复习、浏览和设置页试听发起的请求优先于所有等待任务，同一文本/音色只生成一次。正在运行的 Kokoro 推理不可中断，播放请求会在当前推理结束后先于其余排队任务执行。每次生成的 WAV 会保留在 `/audio` 挂载目录，直到用户在设置页手动清理。AI 日志 `TTS timing:` 分别给出 `model_load_s`（模型加载或等待）、`inference_queue_s`（AI 内部推理锁等待）、`inference_s`（语音生成）和 `encode_s`（WAV 编码）；Go 日志记录队列优先级、AI 耗时、文件大小和传输耗时，不记录单词或句子内容。如果朗读按钮正在等待，会显示忙碌状态并阻止重复提交。浏览器请求最长等待 7 分钟，Go API 对 AI 的上游超时为 6 分钟。
 
 如果日志出现 `open() got an unexpected keyword argument 'metadata_errors'`，说明 faster-whisper 与 PyAV 版本不兼容，ASR 转写会失败但音素评分仍可返回。AI 镜像将 PyAV 限制在 19 以下以避免此错误；更新后再看日志，确认 `asr_inference_s` 大于 0 且不再出现该异常。
 
-该模型是在 SpeechOcean762 英语学习者数据集上训练的研究模型。发布者报告的音素级测试相关系数为 0.606；这个数值不是“正确率”，项目也没有足够的本地学习者样本来校准分数。它可能受录音质量、词典读音和个人口音影响；分数只用于日常练习参考。如果模型首次下载或本地音素对齐失败，接口会显示说明并回退到 ASR 转写比较。Azure 模式仍可在设置中切换。
+该模型是在 SpeechOcean762 英语学习者数据集上训练的研究模型。发布者报告的音素级测试相关系数为 0.606；这个数值不是“正确率”，项目也没有足够的本地学习者样本来校准分数。它可能受录音质量、词典读音和个人口音影响；分数只用于日常练习参考。如果模型首次下载或本地音素对齐失败，界面会显示评分错误，同时保留独立 ASR 转写比较结果。Azure 模式仍可在设置中切换。
 
 ## 词典格式
 
@@ -184,4 +184,3 @@ Go 测试覆盖批量收词 API、发音配置隔离、Azure REST 请求参数/�
 2026-10-05 发音模型预加载与录音交互：启动时按序预加载 Kokoro、faster-whisper ASR 和 Whisper Phoneme CTC，状态进入 `/healthz`、metrics 和设置页；新增 `AI_MODEL_STORAGE_PATH` 持久化挂载。手机录音支持上滑取消及全屏状态浮层，结果和释义分离，复习页面内复用麦克风流。Python 17 项、Go 测试、Web 生产构建、WSL Compose 配置检查和 app/AI 镜像本地构建通过；AI 镜像确认声明 `/models` volume。未在构建时下载模型权重，也未使用真实设备录音；新镜像未推送，Debian 上的模型常驻内存、NAS 写入权限和麦克风体验仍需部署验证。
 
 本机开发环境可以分别运行 Go API 和 Vite 开发服务器；生产容器由 Compose 启动。AI 推理和 Docker 镜像体积较大，建议通过 Docker 构建验证完整部署。
-
