@@ -13,9 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && mkdir -p /models && chown -R aiuser:aiuser /models
 COPY --from=python-deps /install /usr/local
 WORKDIR /app
-COPY server.py /app/server.py
-COPY pronunciation_model.py /app/pronunciation_model.py
-COPY PHONEME_MODEL_LICENSE.txt /app/PHONEME_MODEL_LICENSE.txt
+# The runtime switches to an unprivileged UID below. Set readable modes here
+# because Docker COPY otherwise preserves restrictive modes from the build context.
+COPY --chmod=0644 server.py pronunciation_model.py PHONEME_MODEL_LICENSE.txt /app/
 USER 10002:10002
 EXPOSE 8000
 VOLUME ["/models"]
